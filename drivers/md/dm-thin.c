@@ -3920,6 +3920,7 @@ static void pool_status(struct dm_target *ti, status_type_t type,
 	dm_block_t nr_blocks_data;
 	dm_block_t nr_blocks_metadata;
 	dm_block_t held_root;
+	uint32_t hb_seq;
 	enum pool_mode mode;
 	char buf[BDEVNAME_SIZE];
 	char buf2[BDEVNAME_SIZE];
@@ -4017,6 +4018,12 @@ static void pool_status(struct dm_target *ti, status_type_t type,
 			DMEMIT("- ");
 
 		DMEMIT("%llu ", (unsigned long long)calc_metadata_threshold(pt));
+
+		r = dm_pool_get_heartbeat_sequence(pool->pmd, &hb_seq);
+		if (!r)
+			DMEMIT("%u ", hb_seq);
+		else
+			DMEMIT("- ");
 
 		break;
 

@@ -12,6 +12,8 @@
 
 #include <linux/list.h>
 #include <linux/device-mapper.h>
+#include <linux/kthread.h>
+#include <linux/random.h>
 #include <linux/workqueue.h>
 
 /*--------------------------------------------------------------------------
@@ -79,6 +81,11 @@
 #define THIN_VERSION 2
 #define SECTOR_TO_BLOCK_SHIFT 3
 
+#define THIN_HB_CLEAN 0xFF4D4D50
+#define THIN_HB_SEQ_MAX 0xE24D4D4F
+#define THIN_HB_MIN_UPDATE_INTERVAL 5UL
+#define THIN_HB_MAX_UPDATE_INTERVAL 300UL
+
 /*
  * For btree insert:
  *  3 for btree insert +
@@ -133,6 +140,8 @@ struct thin_disk_superblock {
 	__le32 compat_flags;
 	__le32 compat_ro_flags;
 	__le32 incompat_flags;
+
+	__le64 heartbeat_block;
 } __packed;
 
 struct disk_device_details {
@@ -141,6 +150,22 @@ struct disk_device_details {
 	__le32 creation_time;
 	__le32 snapshotted_time;
 } __packed;
+
+struct disk_heartbeat_info {
+	__le32 csum;
+	__le32 flags;
+	__le64 blocknr;
+	__le32 seq;
+	__le32 update_interval;
+	__le32 check_interval;
+} __packed;
+
+struct heartbeat_info {
+	uint32_t seq;
+	uint32_t update_interval;
+	uint32_t check_interval;
+	unsigned long last_update_time; /* not persistent */
+};
 
 struct dm_pool_metadata {
 	struct hlist_node hash;
@@ -187,6 +212,9 @@ struct dm_pool_metadata {
 	uint64_t trans_id;
 	unsigned long flags;
 	sector_t data_block_size;
+	dm_block_t hb_block;
+	struct heartbeat_info hb_info;
+	struct task_struct *hb_tsk;
 
 	/*
 	 * Pre-commit callback.
@@ -294,6 +322,69 @@ static struct dm_block_validator sb_validator = {
 	.name = "superblock",
 	.prepare_for_write = sb_prepare_for_write,
 	.check = sb_check
+};
+
+/*----------------------------------------------------------------
+ * heartbeat block validator
+ *--------------------------------------------------------------*/
+
+#define HEARTBEAT_CSUM_XOR 320767
+
+static void __heartbeat_prepare_for_write(void *block_data,
+					  dm_block_t location,
+					  size_t block_size)
+{
+	struct disk_heartbeat_info *disk_hb = block_data;
+
+	disk_hb->blocknr = cpu_to_le64(location);
+	disk_hb->csum = cpu_to_le32(dm_bm_checksum(&disk_hb->flags,
+						   block_size - sizeof(__le32),
+						   HEARTBEAT_CSUM_XOR));
+}
+
+static void heartbeat_prepare_for_write(struct dm_block_validator *v,
+					struct dm_block *b,
+					size_t block_size)
+{
+	__heartbeat_prepare_for_write(dm_block_data(b), dm_block_location(b), block_size);
+}
+
+static int __heartbeat_check(const void *block_data,
+			     dm_block_t location,
+			     size_t block_size) {
+	const struct disk_heartbeat_info *disk_hb = block_data;
+	__le32 csum_le;
+
+	if (location != le64_to_cpu(disk_hb->blocknr)) {
+		DMERR("heartbeat_check failed: blocknr %llu: "
+		      "wanted %llu", le64_to_cpu(disk_hb->blocknr),
+		      location);
+		return -ENOTBLK;
+	}
+
+	csum_le = cpu_to_le32(dm_bm_checksum(&disk_hb->flags,
+					     block_size - sizeof(__le32),
+					     HEARTBEAT_CSUM_XOR));
+	if (csum_le != disk_hb->csum) {
+		DMERR("heartbeat_check failed: csum %u: wanted %u",
+		      le32_to_cpu(csum_le), le32_to_cpu(disk_hb->csum));
+		return -EILSEQ;
+	}
+
+	return 0;
+}
+
+static int heartbeat_check(struct dm_block_validator *v,
+			   struct dm_block *b,
+			   size_t block_size)
+{
+	return __heartbeat_check(dm_block_data(b), dm_block_location(b), block_size);
+}
+
+static struct dm_block_validator hb_validator = {
+	.name = "heartbeat_block",
+	.prepare_for_write = heartbeat_prepare_for_write,
+	.check = heartbeat_check
 };
 
 /*----------------------------------------------------------------
@@ -564,7 +655,251 @@ static int __write_initial_superblock(struct dm_pool_metadata *pmd)
 	disk_super->metadata_nr_blocks = cpu_to_le64(bdev_size >> SECTOR_TO_BLOCK_SHIFT);
 	disk_super->data_block_size = cpu_to_le32(pmd->data_block_size);
 
+	disk_super->heartbeat_block = cpu_to_le64(pmd->hb_block);
+
 	return dm_tm_commit(pmd->tm, sblock);
+}
+
+static uint32_t hb_new_seq(void)
+{
+	uint32_t new_seq;
+
+	do {
+		new_seq = prandom_u32();
+	} while (new_seq > THIN_HB_SEQ_MAX);
+
+	return new_seq;
+}
+
+static void hb_endio(struct bio *bio) {
+	// FIXME: is it legal to free page here?
+	bio_put(bio);
+}
+
+static int __read_heartbeat_block(struct dm_pool_metadata *pmd,
+				  dm_block_t blocknr,
+				  struct heartbeat_info *info)
+{
+	struct bio *bio;
+	struct page *page;
+	struct disk_heartbeat_info *src;
+	unsigned block_size;
+	int r;
+
+	bio = bio_alloc_bioset(GFP_NOIO, 1, NULL);
+	if (unlikely(!bio))
+		return -ENOMEM;
+
+	bio_set_dev(bio, pmd->bdev);
+	bio_set_op_attrs(bio, REQ_OP_READ, REQ_SYNC|REQ_META|REQ_PREFLUSH|REQ_FUA);
+	bio->bi_end_io = hb_endio;
+
+	block_size = THIN_METADATA_BLOCK_SIZE << SECTOR_SHIFT;
+	page = alloc_page(GFP_NOIO);
+	if (unlikely(!page)) {
+		r = -ENOMEM;
+		goto free_bio;
+	}
+
+	bio_add_page(bio, page, block_size, 0);
+	bio->bi_iter.bi_sector = blocknr * THIN_METADATA_BLOCK_SIZE;
+
+	r = submit_bio_wait(bio); // should we release bio if submit_bio failed?
+	if (r)
+		goto free_page_and_bio;
+
+	src = kmap_atomic(page);
+	r = __heartbeat_check(src, blocknr, block_size);
+	if (r)
+		goto free_page_and_bio;
+
+	info->seq = le32_to_cpu(src->seq);
+	info->update_interval = le32_to_cpu(src->update_interval);
+	info->check_interval = le32_to_cpu(src->check_interval);
+	kunmap_atomic(src);
+
+	__free_page(page); // FIXME: move to other places?
+	return r;
+
+free_page_and_bio:
+	__free_page(page);
+free_bio:
+	bio_put(bio);
+	return r;
+}
+
+static int __write_heartbeat_block(struct dm_pool_metadata *pmd,
+				   dm_block_t blocknr,
+				   struct heartbeat_info *info)
+{
+	struct bio *bio;
+	struct page *page;
+	struct disk_heartbeat_info *disk_hb;
+	unsigned block_size;
+	int r;
+
+	bio = bio_alloc_bioset(GFP_NOIO, 1, NULL);
+	if (unlikely(!bio))
+		return -ENOMEM;
+
+	bio_set_dev(bio, pmd->bdev);
+	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_SYNC|REQ_META|REQ_PREFLUSH|REQ_FUA);
+	bio->bi_end_io = hb_endio;
+
+	block_size = THIN_METADATA_BLOCK_SIZE << SECTOR_SHIFT;
+	page = alloc_page(GFP_NOIO);
+	if (unlikely(!page)) {
+		r = -ENOMEM;
+		goto free_bio;
+	}
+
+	bio_add_page(bio, page, block_size, 0);
+	bio->bi_iter.bi_sector = blocknr * THIN_METADATA_BLOCK_SIZE;
+
+	disk_hb = kmap_atomic(page);
+	memset(disk_hb, 0, block_size);
+	disk_hb->seq = cpu_to_le32(info->seq);
+	disk_hb->update_interval = cpu_to_le32(info->update_interval);
+	disk_hb->check_interval = cpu_to_le32(info->check_interval);
+	__heartbeat_prepare_for_write(disk_hb, blocknr, block_size);
+	kunmap_atomic(disk_hb);
+
+	r = submit_bio_wait(bio);
+	if (r)
+		goto free_page_and_bio;
+
+	__free_page(page); // FIXME: move to other places?
+	return r;
+
+free_page_and_bio:
+	__free_page(page);
+free_bio:
+	bio_put(bio);
+	return r;
+}
+
+static int __setup_heartbeat_block(struct dm_pool_metadata *pmd)
+{
+	struct dm_block *b;
+	struct disk_heartbeat_info *disk_hb;
+	size_t block_size;
+	uint32_t seq;
+	uint32_t update_interval;
+	int r;
+
+	r = dm_tm_new_block(pmd->tm, &hb_validator, &b);
+	if (r < 0)
+		return r;
+
+	disk_hb = dm_block_data(b);
+	block_size = dm_bm_block_size(dm_tm_get_bm(pmd->tm));
+
+	/* FIXME: duplicated to __write_initial_heartbeat_block */
+	seq = hb_new_seq();
+	update_interval = THIN_HB_MIN_UPDATE_INTERVAL;
+	disk_hb->seq = cpu_to_le32(seq);
+	disk_hb->update_interval = cpu_to_le32(update_interval);
+	disk_hb->check_interval = cpu_to_le32(update_interval);
+
+	pmd->hb_block = dm_block_location(b);
+	pmd->hb_info.seq = seq;
+	pmd->hb_info.update_interval = update_interval;
+	pmd->hb_info.check_interval = update_interval;
+	pmd->hb_info.last_update_time = jiffies;
+
+	dm_tm_unlock(pmd->tm, b);
+
+	return 0;
+}
+
+static int __test_and_set_heartbeat_block(struct dm_pool_metadata *pmd)
+{
+	struct heartbeat_info hb_next;
+	unsigned long update_interval;
+	unsigned long diff;
+	int r;
+
+	update_interval = pmd->hb_info.update_interval;
+	diff = jiffies - pmd->hb_info.last_update_time;
+	if (diff < update_interval * HZ)
+		schedule_timeout_interruptible(update_interval * HZ - diff);
+
+	r = __read_heartbeat_block(pmd, pmd->hb_block, &hb_next);
+	if (r)
+		return r;
+
+	if (hb_next.seq != pmd->hb_info.seq) {
+		DMERR("pool was activated by another node");
+		return -EILSEQ;
+	}
+
+	hb_next.seq += 1;
+	if (hb_next.seq > THIN_HB_SEQ_MAX)
+		hb_next.seq = 1;
+
+	/* record the real update interval as the hint for heartbeat checking */
+	/* TODO: record the statistical average value */
+	hb_next.check_interval = min(max(diff / HZ, update_interval),
+				     THIN_HB_MAX_UPDATE_INTERVAL);
+
+	hb_next.last_update_time = jiffies;
+	r = __write_heartbeat_block(pmd, pmd->hb_block, &hb_next);
+	if (r)
+		return r;
+
+	memcpy(&pmd->hb_info, &hb_next, sizeof(hb_next));
+
+	return 0;
+}
+
+int __clean_heartbeat_block(struct dm_pool_metadata *pmd)
+{
+	struct heartbeat_info hb_next;
+	int r;
+
+	hb_next.seq = THIN_HB_CLEAN;
+	hb_next.last_update_time = jiffies;
+	r = __write_heartbeat_block(pmd, pmd->hb_block, &hb_next);
+	if (r)
+		return r;
+
+	memcpy(&pmd->hb_info, &hb_next, sizeof(hb_next));
+
+	return 0;
+}
+
+static int pool_heartbeat(void *data)
+{
+	struct dm_pool_metadata *pmd = data;
+	int r;
+
+	while (!kthread_should_stop()) {
+		r = __test_and_set_heartbeat_block(pmd);
+
+		// TODO: change pool mode if mismatch found
+		if (r)
+			return r;
+	}
+
+	r = __clean_heartbeat_block(pmd);
+
+	return r;
+}
+
+static int __start_heartbeat_worker(struct dm_pool_metadata *pmd)
+{
+	int r;
+
+	/* FIXME: append pool name in thread id and error messages? */
+	pmd->hb_tsk = kthread_run(pool_heartbeat, pmd, "thin_heartbeat");
+	if (IS_ERR(pmd->hb_tsk)) {
+		DMERR("unable to create heartbeat thread");
+		r = PTR_ERR(pmd->hb_tsk);
+		pmd->hb_tsk = NULL;
+		return r;
+	}
+
+	return 0;
 }
 
 static int __format_metadata(struct dm_pool_metadata *pmd)
@@ -604,7 +939,19 @@ static int __format_metadata(struct dm_pool_metadata *pmd)
 		goto bad_cleanup_nb_tm;
 	}
 
+	/* TODO: enable heartbeat according to feature flags in the table */
+	/* FIXME: check potential race between metadata formatting */
+	r = __setup_heartbeat_block(pmd);
+	if (r < 0) {
+		DMERR("couldn't setup heartbeat block");
+		goto bad_cleanup_nb_tm;
+	}
+
 	r = __write_initial_superblock(pmd);
+	if (r)
+		goto bad_cleanup_nb_tm;
+
+	r = __start_heartbeat_worker(pmd);
 	if (r)
 		goto bad_cleanup_nb_tm;
 
@@ -649,6 +996,76 @@ static int __check_incompat_features(struct thin_disk_superblock *disk_super,
 	return 0;
 }
 
+static int __write_initial_heartbeat_block(struct thin_disk_superblock *disk_super,
+					   struct dm_pool_metadata *pmd)
+{
+	dm_block_t blocknr;
+	struct heartbeat_info info;
+	int r;
+
+	if (!disk_super->heartbeat_block)
+		return -EINVAL;
+
+	blocknr = le64_to_cpu(disk_super->heartbeat_block);
+
+	/* TODO: dynamically adjuist check interval */
+	info.update_interval = THIN_HB_MIN_UPDATE_INTERVAL;
+	info.check_interval = THIN_HB_MIN_UPDATE_INTERVAL;
+	info.seq = hb_new_seq();
+	info.last_update_time = jiffies;
+	r = __write_heartbeat_block(pmd, blocknr, &info);
+	if (r)
+		return r;
+
+	pmd->hb_block = blocknr;
+	memcpy(&pmd->hb_info, &info, sizeof(info));
+
+	return 0;
+}
+
+static int __test_and_initialize_heartbeat_block(struct thin_disk_superblock *disk_super,
+						 struct dm_pool_metadata *pmd)
+{
+	dm_block_t hb_block;
+	struct heartbeat_info hb_info;
+	uint32_t seq;
+	int r;
+
+	if (!disk_super->heartbeat_block)
+		return -EINVAL;
+
+	hb_block = le32_to_cpu(disk_super->heartbeat_block);
+	r = __read_heartbeat_block(pmd, hb_block, &hb_info);
+	if (r)
+		return r;
+
+	seq = hb_info.seq;
+
+	/* Make sure the metadata is inactivated if the sequence is not clean */
+	/* FIXME: should we introduce a heartbeat state like THIN_HB_CHECK?
+	 *        to indicate that the metadata is opened by userland thin-tools
+	 */
+	if (seq != THIN_HB_CLEAN) {
+		/* FIXME: wait for a longer period to make sure that the metadata is really inactivated? */
+		schedule_timeout_interruptible(hb_info.check_interval * HZ);
+
+		r = __read_heartbeat_block(pmd, hb_block, &hb_info);
+		if (r)
+			return r;
+
+		if (seq != hb_info.seq) {
+			DMERR("pool is already activated on another node");
+			return -EILSEQ;
+		}
+	}
+
+	r = __write_initial_heartbeat_block(disk_super, pmd);
+	if (r)
+		return r;
+
+	return 0;
+}
+
 static int __open_metadata(struct dm_pool_metadata *pmd)
 {
 	int r;
@@ -677,13 +1094,27 @@ static int __open_metadata(struct dm_pool_metadata *pmd)
 	if (r < 0)
 		goto bad_unlock_sblock;
 
+	if (disk_super->heartbeat_block) {
+		r = __test_and_initialize_heartbeat_block(disk_super, pmd);
+		if (r)
+			goto bad_unlock_sblock;
+
+		r = __test_and_set_heartbeat_block(pmd);
+		if (r)
+			goto bad_unlock_sblock;
+
+		r = __start_heartbeat_worker(pmd);
+		if (r)
+			goto bad_unlock_sblock;
+	}
+
 	r = dm_tm_open_with_sm(pmd->bm, THIN_SUPERBLOCK_LOCATION,
 			       disk_super->metadata_space_map_root,
 			       sizeof(disk_super->metadata_space_map_root),
 			       &pmd->tm, &pmd->metadata_sm);
 	if (r < 0) {
 		DMERR("tm_open_with_sm failed");
-		goto bad_unlock_sblock;
+		goto bad_stop_heartbeat;
 	}
 
 	pmd->data_sm = dm_sm_disk_open(pmd->tm, disk_super->data_space_map_root,
@@ -711,6 +1142,8 @@ bad_cleanup_data_sm:
 bad_cleanup_tm:
 	dm_tm_destroy(pmd->tm);
 	dm_sm_destroy(pmd->metadata_sm);
+bad_stop_heartbeat:
+	kthread_stop(pmd->hb_tsk);
 bad_unlock_sblock:
 	dm_bm_unlock(sblock);
 
@@ -737,6 +1170,7 @@ static int __create_persistent_data_objects(struct dm_pool_metadata *pmd, bool f
 
 	pmd->bm = dm_block_manager_create(pmd->bdev, THIN_METADATA_BLOCK_SIZE << SECTOR_SHIFT,
 					  THIN_MAX_CONCURRENT_LOCKS);
+
 	if (IS_ERR(pmd->bm)) {
 		DMERR("could not create block manager");
 		return PTR_ERR(pmd->bm);
@@ -751,6 +1185,7 @@ static int __create_persistent_data_objects(struct dm_pool_metadata *pmd, bool f
 
 static void __destroy_persistent_data_objects(struct dm_pool_metadata *pmd)
 {
+	kthread_stop(pmd->hb_tsk);
 	dm_sm_destroy(pmd->data_sm);
 	dm_sm_destroy(pmd->metadata_sm);
 	dm_tm_destroy(pmd->nb_tm);
@@ -780,6 +1215,7 @@ static int __begin_transaction(struct dm_pool_metadata *pmd)
 	pmd->trans_id = le64_to_cpu(disk_super->trans_id);
 	pmd->flags = le32_to_cpu(disk_super->flags);
 	pmd->data_block_size = le32_to_cpu(disk_super->data_block_size);
+	pmd->hb_block = le64_to_cpu(disk_super->heartbeat_block);
 
 	dm_bm_unlock(sblock);
 	return 0;
@@ -911,6 +1347,8 @@ struct dm_pool_metadata *dm_pool_metadata_open(struct block_device *bdev,
 	pmd->data_block_size = data_block_size;
 	pmd->pre_commit_fn = NULL;
 	pmd->pre_commit_context = NULL;
+	memset(&pmd->hb_info, 0, sizeof(pmd->hb_info));
+	pmd->hb_tsk = NULL;
 
 	r = __create_persistent_data_objects(pmd, format_device);
 	if (r) {
@@ -1318,6 +1756,8 @@ static int __reserve_metadata_snap(struct dm_pool_metadata *pmd)
 	       sizeof(disk_super->data_space_map_root));
 	memset(&disk_super->metadata_space_map_root, 0,
 	       sizeof(disk_super->metadata_space_map_root));
+
+	disk_super->heartbeat_block = 0;
 
 	/*
 	 * Increment the data structures that need to be preserved.
@@ -1943,6 +2383,18 @@ int dm_pool_get_data_dev_size(struct dm_pool_metadata *pmd, dm_block_t *result)
 	up_read(&pmd->root_lock);
 
 	return r;
+}
+
+int dm_pool_get_heartbeat_sequence(struct dm_pool_metadata *pmd, uint32_t *seq)
+{
+	if (!pmd->hb_info.seq)
+		return -EINVAL;
+
+	down_read(&pmd->root_lock);
+	*seq = pmd->hb_info.seq;
+	up_read(&pmd->root_lock);
+
+	return 0;
 }
 
 int dm_thin_get_mapped_count(struct dm_thin_device *td, dm_block_t *result)
