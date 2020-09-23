@@ -283,6 +283,8 @@ struct pool {
 
 	mempool_t mapping_pool;
 
+	struct task_struct *heartbeat_task;
+
 	struct bio flush_bio;
 };
 
@@ -2445,6 +2447,51 @@ static void do_no_space_timeout(struct work_struct *ws)
 
 /*----------------------------------------------------------------*/
 
+static inline void wait_for_kthread_stop(void) {
+	while (!kthread_should_stop()) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+	}
+}
+
+static int pool_heartbeat(void *data)
+{
+	struct pool *pool = data;
+	struct dm_pool_metadata *pmd = pool->pmd;
+	int r;
+
+	r = 0;
+	while (!kthread_should_stop()) {
+		r = dm_pool_test_and_set_heartbeat_block(pmd);
+
+		if (r) {
+			metadata_operation_failed(pool, "dm_pool_heartbeat", r);
+			break;
+		}
+	}
+
+	wait_for_kthread_stop();
+	return r;
+}
+
+static int __start_heartbeat_worker(struct pool *pool)
+{
+	int r;
+
+	/* FIXME: append pool name in thread id and error messages? */
+	pool->heartbeat_task = kthread_run(pool_heartbeat, pool, "thin_heartbeat");
+	if (IS_ERR(pool->heartbeat_task)) {
+		DMERR("unable to create heartbeat thread");
+		r = PTR_ERR(pool->heartbeat_task);
+		pool->heartbeat_task = NULL;
+		return r;
+	}
+
+	return 0;
+}
+
+/*----------------------------------------------------------------*/
+
 struct pool_work {
 	struct work_struct worker;
 	struct completion complete;
@@ -2929,6 +2976,11 @@ static void __pool_destroy(struct pool *pool)
 	bio_uninit(&pool->flush_bio);
 	dm_deferred_set_destroy(pool->shared_read_ds);
 	dm_deferred_set_destroy(pool->all_io_ds);
+
+	/* TODO: use superblock flags */
+	if (pool->heartbeat_task)
+		kthread_stop(pool->heartbeat_task);
+
 	kfree(pool);
 }
 
@@ -2945,6 +2997,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	struct pool *pool;
 	struct dm_pool_metadata *pmd;
 	bool format_device = read_only ? false : true;
+	uint32_t hb_seq;
 
 	pmd = dm_pool_metadata_open(metadata_dev, block_size, format_device);
 	if (IS_ERR(pmd)) {
@@ -3047,6 +3100,13 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	pool->md_dev = metadata_dev;
 	pool->data_dev = data_dev;
 	__pool_table_insert(pool);
+
+	/* TODO: use superblock flag instead */
+	if (!dm_pool_get_heartbeat_sequence(pool->pmd, &hb_seq)) {
+		r = __start_heartbeat_worker(pool);
+		if (r)
+			goto bad_sort_array;
+	}
 
 	return pool;
 

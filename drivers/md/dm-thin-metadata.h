@@ -195,8 +195,6 @@ int dm_pool_get_metadata_dev_size(struct dm_pool_metadata *pmd,
 
 int dm_pool_get_data_dev_size(struct dm_pool_metadata *pmd, dm_block_t *result);
 
-int dm_pool_get_heartbeat_sequence(struct dm_pool_metadata *pmd, uint32_t *seq);
-
 int dm_pool_block_is_shared(struct dm_pool_metadata *pmd, dm_block_t b, bool *result);
 
 int dm_pool_inc_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_t e);
@@ -238,6 +236,12 @@ typedef int (*dm_pool_pre_commit_fn)(void *context);
 void dm_pool_register_pre_commit_callback(struct dm_pool_metadata *pmd,
 					  dm_pool_pre_commit_fn fn,
 					  void *context);
+
+/*
+ * Perform heartbeat
+ */
+int dm_pool_test_and_set_heartbeat_block(struct dm_pool_metadata *pmd);
+int dm_pool_get_heartbeat_sequence(struct dm_pool_metadata *pmd, uint32_t *seq);
 
 /*----------------------------------------------------------------*/
 
