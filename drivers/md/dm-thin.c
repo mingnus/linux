@@ -2960,6 +2960,12 @@ static void __pool_destroy(struct pool *pool)
 {
 	__pool_table_remove(pool);
 
+	/* TODO: stop the heartbeat task earlier if possible,
+	 *       e.g., on heartbeat failed.
+	 */
+	if (pool->heartbeat_task)
+		kthread_stop(pool->heartbeat_task);
+
 	vfree(pool->cell_sort_array);
 	if (dm_pool_metadata_close(pool->pmd) < 0)
 		DMWARN("%s: dm_pool_metadata_close() failed.", __func__);
@@ -2977,10 +2983,6 @@ static void __pool_destroy(struct pool *pool)
 	dm_deferred_set_destroy(pool->shared_read_ds);
 	dm_deferred_set_destroy(pool->all_io_ds);
 
-	/* TODO: use superblock flags */
-	if (pool->heartbeat_task)
-		kthread_stop(pool->heartbeat_task);
-
 	kfree(pool);
 }
 
@@ -2997,7 +2999,6 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	struct pool *pool;
 	struct dm_pool_metadata *pmd;
 	bool format_device = read_only ? false : true;
-	uint32_t hb_seq;
 
 	pmd = dm_pool_metadata_open(metadata_dev, block_size, format_device);
 	if (IS_ERR(pmd)) {
@@ -3101,8 +3102,9 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	pool->data_dev = data_dev;
 	__pool_table_insert(pool);
 
-	/* TODO: use superblock flag instead */
-	if (!dm_pool_get_heartbeat_sequence(pool->pmd, &hb_seq)) {
+	/* TODO: allow enable/disable heartbeat via table flags? */
+	pool->heartbeat_task = NULL;
+	if (dm_pool_heartbeat_enabled(pool->pmd)) {
 		r = __start_heartbeat_worker(pool);
 		if (r)
 			goto bad_sort_array;

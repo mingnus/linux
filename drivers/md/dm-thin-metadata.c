@@ -392,6 +392,23 @@ static struct dm_block_validator hb_validator = {
 };
 
 /*----------------------------------------------------------------
+ * Methods for superblock attributes
+ *--------------------------------------------------------------*/
+
+#define THIN_SETGET_STACK_FUNCS(name, type, member, bits)		\
+static inline u##bits thin_##name(const type *s)			\
+{									\
+	return le##bits##_to_cpu(s->member);				\
+}									\
+static inline void thin_set_##name(type *s, u##bits val)		\
+{									\
+	s->member = cpu_to_le##bits(val);				\
+}
+
+THIN_SETGET_STACK_FUNCS(super_compat_ro_flags, struct thin_disk_superblock,
+			compat_ro_flags, 32);
+
+/*----------------------------------------------------------------
  * Methods for the btree value types
  *--------------------------------------------------------------*/
 
@@ -660,6 +677,7 @@ static int __write_initial_superblock(struct dm_pool_metadata *pmd)
 	disk_super->data_block_size = cpu_to_le32(pmd->data_block_size);
 
 	disk_super->heartbeat_block = cpu_to_le64(pmd->hb_block);
+	thin_set_super_compat_ro_flags(disk_super, THIN_FEATURE_COMPAT_RO_HEARTBEAT);
 
 	return dm_tm_commit(pmd->tm, sblock);
 }
@@ -921,7 +939,6 @@ static int __cleanup_heartbeat_block(struct dm_pool_metadata *pmd)
 	return 0;
 }
 
-
 static int __format_metadata(struct dm_pool_metadata *pmd)
 {
 	int r;
@@ -1087,6 +1104,7 @@ static int __open_metadata(struct dm_pool_metadata *pmd)
 	int r;
 	struct dm_block *sblock;
 	struct thin_disk_superblock *disk_super;
+	uint32_t features;
 
 	r = dm_bm_read_lock(pmd->bm, THIN_SUPERBLOCK_LOCATION,
 			    &sb_validator, &sblock);
@@ -1110,9 +1128,9 @@ static int __open_metadata(struct dm_pool_metadata *pmd)
 	if (r < 0)
 		goto bad_unlock_sblock;
 
-	/* Do not initialize the heartbeat block if the previous heartbeat */
-	/* TODO: use feature flag instead */
-	if (disk_super->heartbeat_block && !pmd->fail_heartbeat) {
+	/* Do not initialize the heartbeat block if there was error */
+	features = thin_super_compat_ro_flags(disk_super);
+	if ((features & THIN_FEATURE_COMPAT_RO_HEARTBEAT) && !pmd->fail_heartbeat) {
 		r = __test_and_initialize_heartbeat_block(disk_super, pmd);
 		if (r < 0)
 			goto bad_unlock_sblock;
@@ -2409,6 +2427,17 @@ int dm_pool_get_heartbeat_sequence(struct dm_pool_metadata *pmd, uint32_t *seq)
 	up_read(&pmd->root_lock);
 
 	return 0;
+}
+
+bool dm_pool_heartbeat_enabled(struct dm_pool_metadata *pmd)
+{
+	bool enabled;
+
+	down_read(&pmd->root_lock);
+	enabled = (pmd->hb_info.seq > 0);
+	up_read(&pmd->root_lock);
+
+        return enabled;
 }
 
 int dm_thin_get_mapped_count(struct dm_thin_device *td, dm_block_t *result)

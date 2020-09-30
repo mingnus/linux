@@ -51,8 +51,10 @@ int dm_pool_metadata_close(struct dm_pool_metadata *pmd);
  * Compat feature flags.  Any incompat flags beyond the ones
  * specified below will prevent use of the thin metadata.
  */
+#define THIN_FEATURE_COMPAT_RO_HEARTBEAT  (1UL << 0)
+
 #define THIN_FEATURE_COMPAT_SUPP	  0UL
-#define THIN_FEATURE_COMPAT_RO_SUPP	  0UL
+#define THIN_FEATURE_COMPAT_RO_SUPP	  (THIN_FEATURE_COMPAT_RO_HEARTBEAT)
 #define THIN_FEATURE_INCOMPAT_SUPP	  0UL
 
 /*
@@ -242,6 +244,7 @@ void dm_pool_register_pre_commit_callback(struct dm_pool_metadata *pmd,
  */
 int dm_pool_test_and_set_heartbeat_block(struct dm_pool_metadata *pmd);
 int dm_pool_get_heartbeat_sequence(struct dm_pool_metadata *pmd, uint32_t *seq);
+bool dm_pool_heartbeat_enabled(struct dm_pool_metadata *pmd);
 
 /*----------------------------------------------------------------*/
 
