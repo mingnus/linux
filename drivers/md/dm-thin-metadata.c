@@ -720,7 +720,7 @@ static int __read_heartbeat_block(struct dm_pool_metadata *pmd,
 	page = alloc_page(GFP_NOIO);
 	if (unlikely(!page)) {
 		r = -ENOMEM;
-		goto free_bio;
+		goto bad_cleanup_bio;
 	}
 
 	bio_add_page(bio, page, block_size, 0);
@@ -728,12 +728,12 @@ static int __read_heartbeat_block(struct dm_pool_metadata *pmd,
 
 	r = submit_bio_wait(bio); // should we release bio if submit_bio failed?
 	if (r)
-		goto free_page_and_bio;
+		goto bad_cleanup_page;
 
 	src = kmap_atomic(page);
 	r = __heartbeat_check(src, blocknr, block_size);
 	if (r)
-		goto free_page_and_bio;
+		goto bad_unmap_page;
 
 	info->seq = le32_to_cpu(src->seq);
 	info->update_interval = le32_to_cpu(src->update_interval);
@@ -743,9 +743,11 @@ static int __read_heartbeat_block(struct dm_pool_metadata *pmd,
 	__free_page(page); // FIXME: move to other places?
 	return r;
 
-free_page_and_bio:
+bad_unmap_page:
+	kunmap_atomic(src);
+bad_cleanup_page:
 	__free_page(page);
-free_bio:
+bad_cleanup_bio:
 	bio_put(bio);
 	return r;
 }
