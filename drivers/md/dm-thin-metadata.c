@@ -163,7 +163,7 @@ struct heartbeat_info {
 	uint32_t seq;
 	uint32_t update_interval;
 	uint32_t check_interval;
-	unsigned long last_update_time; /* not persistent */
+	unsigned long last_update_time; /* non-persistent */
 };
 
 struct dm_pool_metadata {
@@ -818,7 +818,6 @@ static int __setup_heartbeat_block(struct dm_pool_metadata *pmd)
 	disk_hb = dm_block_data(b);
 	block_size = dm_bm_block_size(dm_tm_get_bm(pmd->tm));
 
-	/* FIXME: duplicated to __write_initial_heartbeat_block */
 	seq = hb_new_seq();
 	update_interval = THIN_HB_MIN_UPDATE_INTERVAL;
 	disk_hb->seq = cpu_to_le32(seq);
@@ -865,7 +864,7 @@ int __test_heartbeat_block(struct dm_pool_metadata *pmd,
 		hb_next->seq = 1;
 
 	/* record the real update interval as the hint for heartbeat checking */
-	/* TODO: record the statistical average value */
+	/* TODO: apply moving average techniques */
 	hb_next->check_interval = min(max(diff / HZ, update_interval),
 				      THIN_HB_MAX_UPDATE_INTERVAL);
 
@@ -978,8 +977,7 @@ static int __format_metadata(struct dm_pool_metadata *pmd)
 		goto bad_cleanup_nb_tm;
 	}
 
-	/* TODO: enable heartbeat according to feature flags in the table */
-	/* FIXME: check potential race between metadata formatting */
+	/* TODO: enable heartbeating according to feature flags in the table */
 	r = __setup_heartbeat_block(pmd);
 	if (r < 0) {
 		DMERR("couldn't setup heartbeat block");
@@ -1077,11 +1075,11 @@ static int __test_and_initialize_heartbeat_block(struct thin_disk_superblock *di
 	seq = hb_info.seq;
 
 	/* Make sure the metadata is inactivated if the sequence is not clean */
-	/* FIXME: should we introduce a heartbeat state like THIN_HB_CHECK?
-	 *        to indicate that the metadata is opened by userland thin-tools
+	/* TODO: introduce a heartbeating state like THIN_HB_CHECK
+	 *       to indicate that the metadata is opened by userland thin-tools
 	 */
 	if (seq != THIN_HB_CLEAN) {
-		/* FIXME: wait for a longer period to make sure that the metadata is really inactivated? */
+		/* FIXME: enlarge the wait period for safety */
 		schedule_timeout_interruptible(hb_info.check_interval * HZ);
 
 		r = __read_heartbeat_block(pmd, hb_block, &hb_info);
@@ -1130,7 +1128,7 @@ static int __open_metadata(struct dm_pool_metadata *pmd)
 	if (r < 0)
 		goto bad_unlock_sblock;
 
-	/* Do not initialize the heartbeat block if there was error */
+	/* Check for multiple activation if necessary */
 	features = thin_super_compat_ro_flags(disk_super);
 	if ((features & THIN_FEATURE_COMPAT_RO_HEARTBEAT) && !pmd->fail_heartbeat) {
 		r = __test_and_initialize_heartbeat_block(disk_super, pmd);
