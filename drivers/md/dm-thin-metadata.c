@@ -1361,7 +1361,7 @@ struct dm_pool_metadata *dm_pool_metadata_open(struct block_device *bdev,
 	int r;
 	struct dm_pool_metadata *pmd;
 
-	pmd = kmalloc(sizeof(*pmd), GFP_KERNEL);
+	pmd = kzalloc(sizeof(*pmd), GFP_KERNEL);
 	if (!pmd) {
 		DMERR("could not allocate metadata struct");
 		return ERR_PTR(-ENOMEM);
