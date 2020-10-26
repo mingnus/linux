@@ -13,6 +13,7 @@
 #include <linux/list.h>
 #include <linux/device-mapper.h>
 #include <linux/random.h>
+#include <linux/sched/loadavg.h>
 #include <linux/workqueue.h>
 
 /*--------------------------------------------------------------------------
@@ -84,6 +85,7 @@
 #define THIN_HB_SEQ_MAX 0xE24D4D4F
 #define THIN_HB_MIN_UPDATE_INTERVAL 5UL
 #define THIN_HB_MAX_UPDATE_INTERVAL 300UL
+#define EXP 753 /* exp(-1) in fixed-point */
 
 /*
  * For btree insert:
@@ -163,7 +165,10 @@ struct heartbeat_info {
 	uint32_t seq;
 	uint32_t update_interval;
 	uint32_t check_interval;
-	unsigned long last_update_time; /* non-persistent */
+
+	/* non-persistent fields */
+	unsigned long last_update_time;
+	unsigned long hb_interval_avg;
 };
 
 struct dm_pool_metadata {
@@ -838,15 +843,15 @@ static int __setup_heartbeat_block(struct dm_pool_metadata *pmd)
 int __test_heartbeat_block(struct dm_pool_metadata *pmd,
 			   struct heartbeat_info *hb_next)
 {
-	unsigned long update_interval;
+	unsigned long update_interval_hz;
 	unsigned long check_time;
 	unsigned long diff;
 	int r;
 
-	update_interval = pmd->hb_info.update_interval;
+	update_interval_hz = pmd->hb_info.update_interval * HZ;
 	diff = jiffies - pmd->hb_info.last_update_time;
-	if (diff < update_interval * HZ)
-		schedule_timeout_interruptible(update_interval * HZ - diff);
+	if (diff < update_interval_hz)
+		schedule_timeout_interruptible(update_interval_hz - diff);
 
 	check_time = jiffies;
 
@@ -864,9 +869,9 @@ int __test_heartbeat_block(struct dm_pool_metadata *pmd,
 		hb_next->seq = 1;
 
 	/* record the real update interval as the hint for heartbeat checking */
-	/* TODO: apply moving average techniques */
-	hb_next->check_interval = min(max(diff / HZ, update_interval),
-				      THIN_HB_MAX_UPDATE_INTERVAL);
+	diff = min(max(diff, update_interval_hz), THIN_HB_MAX_UPDATE_INTERVAL * HZ);
+	pmd->hb_info.hb_interval_avg = calc_load(pmd->hb_info.hb_interval_avg, EXP, diff);
+	hb_next->check_interval = DIV_ROUND_UP(pmd->hb_info.hb_interval_avg, HZ);
 
 	hb_next->last_update_time = check_time;
 
@@ -1041,7 +1046,6 @@ static int __write_initial_heartbeat_block(struct thin_disk_superblock *disk_sup
 
 	blocknr = le64_to_cpu(disk_super->heartbeat_block);
 
-	/* TODO: dynamically adjuist check interval */
 	info.update_interval = THIN_HB_MIN_UPDATE_INTERVAL;
 	info.check_interval = THIN_HB_MIN_UPDATE_INTERVAL;
 	info.seq = hb_new_seq();
@@ -1378,6 +1382,7 @@ struct dm_pool_metadata *dm_pool_metadata_open(struct block_device *bdev,
 	pmd->pre_commit_fn = NULL;
 	pmd->pre_commit_context = NULL;
 	memset(&pmd->hb_info, 0, sizeof(pmd->hb_info));
+	pmd->hb_info.hb_interval_avg = THIN_HB_MIN_UPDATE_INTERVAL * HZ;
 
 	r = __create_persistent_data_objects(pmd, format_device);
 	if (r) {
