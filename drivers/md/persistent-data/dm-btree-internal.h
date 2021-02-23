@@ -144,4 +144,10 @@ extern struct dm_block_validator btree_node_validator;
 extern void init_le64_type(struct dm_transaction_manager *tm,
 			   struct dm_btree_value_type *vt);
 
+void btree_shift_entries(struct btree_node *left, struct btree_node *right, int count);
+
+int rebalance_children(struct shadow_spine *s,
+		      struct dm_btree_info *info,
+		      struct dm_btree_value_type *vt, uint64_t key);
+
 #endif	/* DM_BTREE_INTERNAL_H */

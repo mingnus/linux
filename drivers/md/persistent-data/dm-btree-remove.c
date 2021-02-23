@@ -196,6 +196,11 @@ static void shift(struct btree_node *left, struct btree_node *right, int count)
 	right->header.nr_entries = cpu_to_le32(nr_right + count);
 }
 
+void btree_shift_entries(struct btree_node *left, struct btree_node *right, int count)
+{
+	shift(left, right, count);
+}
+
 static void __rebalance2(struct dm_btree_info *info, struct btree_node *parent,
 			 struct child *l, struct child *r)
 {
@@ -404,9 +409,9 @@ static int rebalance3(struct shadow_spine *s, struct dm_btree_info *info,
 	return 0;
 }
 
-static int rebalance_children(struct shadow_spine *s,
-			      struct dm_btree_info *info,
-			      struct dm_btree_value_type *vt, uint64_t key)
+int rebalance_children(struct shadow_spine *s,
+		       struct dm_btree_info *info,
+		       struct dm_btree_value_type *vt, uint64_t key)
 {
 	int i, r, has_left_sibling, has_right_sibling;
 	struct btree_node *n;
