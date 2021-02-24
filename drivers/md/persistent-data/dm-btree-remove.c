@@ -409,8 +409,8 @@ static int rebalance3(struct shadow_spine *s, struct dm_btree_info *info,
 	return 0;
 }
 
-int rebalance_children(struct shadow_spine *s,
-		       struct dm_btree_info *info,
+static int rebalance_children(struct shadow_spine *s,
+		              struct dm_btree_info *info,
 		       struct dm_btree_value_type *vt, uint64_t key)
 {
 	int i, r, has_left_sibling, has_right_sibling;
