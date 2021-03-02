@@ -502,84 +502,97 @@ EXPORT_SYMBOL_GPL(dm_btree_lookup_next);
 
 /*----------------------------------------------------------------*/
 
-/*
- * A common operation is to redistribute btree entries across different
- * nodes.  'copy_cursor's are used to keep track of the source and
- * destination of these moves.
- */
-struct cursor_entry {
-	struct btree_node *n;
-	unsigned begin;
-	unsigned end;
-};
-
-#define MAX_CURSOR_ENTRIES 3
-
-struct copy_cursor {
-	unsigned count;
-	unsigned index;
-	struct cursor_entry entries[MAX_CURSOR_ENTRIES];
-};
-
-static void cursor_entry_init(struct cursor_entry *e, struct btree_node *n,
-                              unsigned begin, unsigned end)
+static void copy_entries(struct btree_node *dest, unsigned dest_offset,
+                         struct btree_node *src, unsigned src_offset,
+                         unsigned count)
 {
-	e->n = n;
-	e->begin = begin;
-	e->end = end;
+	size_t value_size = le32_to_cpu(dest->header.value_size);
+	memcpy(dest->keys + dest_offset, src->keys + src_offset, count * sizeof(uint64_t));
+	memcpy(value_ptr(dest, dest_offset), value_ptr(src, src_offset), count * value_size);
+}
+
+static void move_entries(struct btree_node *dest, unsigned dest_offset,
+                         struct btree_node *src, unsigned src_offset,
+                         unsigned count)
+{
+	size_t value_size = le32_to_cpu(dest->header.value_size);
+	memmove(dest->keys + dest_offset, src->keys + src_offset, count * sizeof(uint64_t));
+	memmove(value_ptr(dest, dest_offset), value_ptr(src, src_offset), count * value_size);
+}
+
+static void shift_down(struct btree_node *n, unsigned count)
+{
+	move_entries(n, 0, n, count, le32_to_cpu(n->header.nr_entries) - count);
+}
+
+static void shift_up(struct btree_node *n, unsigned count)
+{
+	move_entries(n, count, n, 0, le32_to_cpu(n->header.nr_entries));
+}
+
+static void redistribute2(struct btree_node *left, struct btree_node *right)
+{
+	unsigned nr_left = le32_to_cpu(left->header.nr_entries);
+	unsigned nr_right = le32_to_cpu(right->header.nr_entries);
+	unsigned total = nr_left + nr_right;
+	unsigned target_left = total / 2;
+	unsigned target_right = total - target_left;
+
+	if (nr_left < target_left) {
+		unsigned delta = target_left - nr_left;
+		copy_entries(left, nr_left, right, 0, delta);
+		shift_down(right, delta);
+	} else if (nr_left > target_left) {
+		unsigned delta = nr_left - target_left;
+		if (nr_right)
+			shift_up(right, delta);
+		copy_entries(right, 0, left, target_left, delta);
+	}
+
+	left->header.nr_entries = cpu_to_le32(target_left);
+	right->header.nr_entries = cpu_to_le32(target_right);
 }
 
 /*
- * Consumes 'len' entries from the front of the cursor.
+ * Assumes the center node is empty.
  */
-static int consume_cursor(struct copy_cursor *c, unsigned len)
+static void redistribute3(struct btree_node *left, struct btree_node *center, struct btree_node *right)
 {
-	while ((c->index < c->count) && len) {
-		struct cursor_entry *e = c->entries + c->index;
-		unsigned e_len = e->end - e->begin;
+	unsigned nr_left = le32_to_cpu(left->header.nr_entries);
+	unsigned nr_center = le32_to_cpu(center->header.nr_entries);
+	unsigned nr_right = le32_to_cpu(right->header.nr_entries);
+	unsigned total, target_left, target_center, target_right;
 
-		if (e_len <= len) {
-			len -= e_len;
-			c->index++;
-		} else {
-			e->begin += len;
-			len = 0;
-		}
+	BUG_ON(nr_center);
+
+	total = nr_left + nr_right;
+	target_left = total / 3;
+	target_center = (total - target_left) / 2;
+	target_right = (total - target_left - target_center);
+
+	if (nr_left < target_left) {
+		unsigned left_short = target_left - nr_left;
+		copy_entries(left, nr_left, right, 0, left_short);
+		copy_entries(center, 0, right, left_short, target_center);
+		shift_down(right, nr_right - target_right);
+
+	} else if (nr_left < (target_left + target_center)) {
+		unsigned left_to_center = nr_left - target_left;
+		copy_entries(center, 0, left, target_left, left_to_center);
+		copy_entries(center, left_to_center, right, 0, target_center - left_to_center);
+		shift_down(right, nr_right - target_right);
+
+	} else {
+		unsigned right_short = target_right - nr_right;
+		pr_alert("shift_up from redist3");
+		shift_up(right, right_short);
+		copy_entries(right, 0, left, nr_left - right_short, right_short);
+		copy_entries(center, 0, left, target_left, nr_left - target_left);
 	}
 
-	return len ? -ENOMEM : 0;
-}
-
-/*
- * memmoves the entries from 'src' to 'dest'.
- */
-static int redistribute_entries(struct copy_cursor *dest, struct copy_cursor *src, unsigned len)
-{
-	int r;
-
-	while (len) {
-		struct cursor_entry *se = src->entries + src->index;
-		struct cursor_entry *de = dest->entries + dest->index;
-		unsigned slen = se->end - se->begin;
-		unsigned dlen = de->end - de->begin;
-		unsigned copy_len = min(len, min(slen, dlen));
-		size_t value_size = le32_to_cpu(se->n->header.value_size);
-
-		memmove(de->n->keys + de->begin, se->n->keys + se->begin, copy_len * sizeof(uint64_t));
-		memmove(value_ptr(de->n, de->begin), value_ptr(se->n, se->begin), copy_len * value_size);
-
-		r = consume_cursor(src, copy_len);
-		if (r)
-			return r;
-
-		r = consume_cursor(dest, copy_len);
-		if (r)
-			return r;
-
-		len -= copy_len;
-	}
-
-	return 0;
+	left->header.nr_entries = cpu_to_le32(target_left);
+	center->header.nr_entries = cpu_to_le32(target_center);
+	right->header.nr_entries = cpu_to_le32(target_right);
 }
 
 /*
@@ -616,10 +629,8 @@ static int split_one_into_two(struct shadow_spine *s, unsigned parent_index,
                               struct dm_btree_value_type *vt, uint64_t key)
 {
 	int r;
-	unsigned nr_left, target_left, target_right;
 	struct dm_block *left, *right, *parent;
 	struct btree_node *ln, *rn, *pn;
-	struct copy_cursor src, dest;
 	__le64 location;
 
 	left = shadow_current(s);
@@ -631,32 +642,11 @@ static int split_one_into_two(struct shadow_spine *s, unsigned parent_index,
 	ln = dm_block_data(left);
 	rn = dm_block_data(right);
 
-	nr_left = le32_to_cpu(ln->header.nr_entries);
-	target_left = nr_left / 2;
-	target_right = nr_left - target_left;
-
 	rn->header.flags = ln->header.flags;
+	rn->header.nr_entries = cpu_to_le32(0);
 	rn->header.max_entries = ln->header.max_entries;
 	rn->header.value_size = ln->header.value_size;
-
-	/* redistribute */
-        src.count = 1;
-        src.index = 0;
-        cursor_entry_init(src.entries + 0, ln, 0, nr_left);
-
-        dest.count = 2;
-        dest.index = 0;
-        cursor_entry_init(dest.entries + 0, ln, 0, target_left);
-        cursor_entry_init(dest.entries + 1, rn, 0, target_right);
-
-	r = redistribute_entries(&dest, &src, nr_left);
-        if (r) {
-	        unlock_block(s->info, right);
-	        return r;
-        }
-
-	ln->header.nr_entries = cpu_to_le32(target_left);
-	rn->header.nr_entries = cpu_to_le32(target_right);
+	redistribute2(ln, rn);
 
 	/* patch up the parent */
 	parent = shadow_parent(s);
@@ -718,10 +708,9 @@ static int split_two_into_three(struct shadow_spine *s, unsigned parent_index,
                                 struct dm_btree_value_type *vt, uint64_t key)
 {
 	int r;
-	unsigned nr_entries, nr_left, nr_right, target_left, target_middle, target_right, middle_index;
+	unsigned middle_index;
 	struct dm_block *left, *middle, *right, *parent;
 	struct btree_node *ln, *rn, *mn, *pn;
-	struct copy_cursor src, dest;
 	__le64 location;
 
 	parent = shadow_parent(s);
@@ -747,37 +736,12 @@ static int split_two_into_three(struct shadow_spine *s, unsigned parent_index,
 	mn = dm_block_data(middle);
 	rn = dm_block_data(right);
 
-	nr_left = le32_to_cpu(ln->header.nr_entries);
-	nr_right = le32_to_cpu(rn->header.nr_entries);
-	nr_entries = nr_left + nr_right;
-
-	target_left = target_middle = nr_entries / 3;
-	target_right = nr_entries - target_left - target_middle;
-
-	mn->header.nr_entries = cpu_to_le32(target_middle);
+	mn->header.nr_entries = cpu_to_le32(0);
 	mn->header.flags = ln->header.flags;
 	mn->header.max_entries = ln->header.max_entries;
 	mn->header.value_size = ln->header.value_size;
 
-	/* redistribute */
-        src.count = 2;
-        src.index = 0;
-        cursor_entry_init(src.entries + 0, ln, 0, nr_left);
-        cursor_entry_init(src.entries + 1, rn, 0, nr_right);
-
-        dest.count = 3;
-        dest.index = 0;
-        cursor_entry_init(dest.entries + 0, ln, 0, target_left);
-        cursor_entry_init(dest.entries + 1, mn, 0, target_middle);
-        cursor_entry_init(dest.entries + 2, rn, 0, target_right);
-
-	r = redistribute_entries(&dest, &src, nr_entries);
-        if (r)
-	        goto unlock_bad;
-
-        ln->header.nr_entries = cpu_to_le32(target_left);
-        mn->header.nr_entries = cpu_to_le32(target_middle);
-        rn->header.nr_entries = cpu_to_le32(target_right);
+	redistribute3(ln, mn, rn);
 
 	/* patch up the parent */
 	pn->keys[middle_index] = rn->keys[0];
@@ -785,8 +749,18 @@ static int split_two_into_three(struct shadow_spine *s, unsigned parent_index,
 	__dm_bless_for_disk(&location);
 	r = insert_at(sizeof(__le64), pn, middle_index,
 		      le64_to_cpu(mn->keys[0]), &location);
-	if (r)
-		goto unlock_bad;
+	if (r) {
+	        if (shadow_current(s) != left)
+		        unlock_block(s->info, left);
+
+	        unlock_block(s->info, middle);
+
+	        if (shadow_current(s) != right)
+		        unlock_block(s->info, right);
+
+	        return r;
+	}
+
 
         /* patch up the spine */
 	if (key < le64_to_cpu(mn->keys[0])) {
@@ -804,17 +778,6 @@ static int split_two_into_three(struct shadow_spine *s, unsigned parent_index,
 	}
 
 	return 0;
-
-unlock_bad:
-        if (shadow_current(s) != left)
-	        unlock_block(s->info, left);
-
-        unlock_block(s->info, middle);
-
-        if (shadow_current(s) != right)
-	        unlock_block(s->info, right);
-
-        return r;
 }
 
 /*----------------------------------------------------------------*/
@@ -918,7 +881,7 @@ static int btree_split_beneath(struct shadow_spine *s, uint64_t key)
 static int rebalance_left(struct shadow_spine *s, struct dm_btree_value_type *vt,
                           unsigned parent_index, uint64_t key)
 {
-	int shift, r;
+	int r;
 	struct dm_block *sib;
 	struct btree_node *left, *right, *parent = dm_block_data(shadow_parent(s));
 
@@ -928,10 +891,7 @@ static int rebalance_left(struct shadow_spine *s, struct dm_btree_value_type *vt
 
 	left = dm_block_data(sib);
 	right = dm_block_data(shadow_current(s));
-
-        shift = (le32_to_cpu(left->header.max_entries) - le32_to_cpu(left->header.nr_entries)) / 2;
-	btree_shift_entries(left, right, -shift);
-
+	redistribute2(left, right);
 	*key_ptr(parent, parent_index) = right->keys[0];
 
 	if (key < le64_to_cpu(right->keys[0])) {
@@ -948,7 +908,7 @@ static int rebalance_left(struct shadow_spine *s, struct dm_btree_value_type *vt
 static int rebalance_right(struct shadow_spine *s, struct dm_btree_value_type *vt,
                            unsigned parent_index, uint64_t key)
 {
-	int shift, r;
+	int r;
 	struct dm_block *sib;
 	struct btree_node *left, *right, *parent = dm_block_data(shadow_parent(s));
 
@@ -958,10 +918,7 @@ static int rebalance_right(struct shadow_spine *s, struct dm_btree_value_type *v
 
 	left = dm_block_data(shadow_current(s));
 	right = dm_block_data(sib);
-
-	shift = (le32_to_cpu(right->header.max_entries) - le32_to_cpu(right->header.nr_entries)) / 2;
-	btree_shift_entries(left, right, shift);
-
+	redistribute2(left, right);
 	*key_ptr(parent, parent_index + 1) = right->keys[0];
 
 	if (key < le64_to_cpu(right->keys[0])) {
@@ -998,7 +955,7 @@ static int get_node_free_space(struct dm_btree_info *info, dm_block_t b, unsigne
  * creating a new sibling node.  SPACE_THRESHOLD defines the minimum number
  * of free entries that must be in the sibling to make the move worth while.
  */
-#define SPACE_THRESHOLD 16
+#define SPACE_THRESHOLD 8
 static int rebalance_or_split(struct shadow_spine *s, struct dm_btree_value_type *vt,
                               unsigned parent_index, uint64_t key)
 {

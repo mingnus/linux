@@ -196,11 +196,6 @@ static void shift(struct btree_node *left, struct btree_node *right, int count)
 	right->header.nr_entries = cpu_to_le32(nr_right + count);
 }
 
-void btree_shift_entries(struct btree_node *left, struct btree_node *right, int count)
-{
-	shift(left, right, count);
-}
-
 static void __rebalance2(struct dm_btree_info *info, struct btree_node *parent,
 			 struct child *l, struct child *r)
 {
