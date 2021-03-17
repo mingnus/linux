@@ -556,7 +556,7 @@ static void redistribute2(struct btree_node *left, struct btree_node *right)
 /*
  * Assumes the center node is empty.
  */
-static void redistribute3(struct btree_node *left, struct btree_node *center, struct btree_node *right)
+noinline void redistribute3(struct btree_node *left, struct btree_node *center, struct btree_node *right)
 {
 	unsigned nr_left = le32_to_cpu(left->header.nr_entries);
 	unsigned nr_center = le32_to_cpu(center->header.nr_entries);
@@ -584,7 +584,6 @@ static void redistribute3(struct btree_node *left, struct btree_node *center, st
 
 	} else {
 		unsigned right_short = target_right - nr_right;
-		pr_alert("shift_up from redist3");
 		shift_up(right, right_short);
 		copy_entries(right, 0, left, nr_left - right_short, right_short);
 		copy_entries(center, 0, left, target_left, nr_left - target_left);
