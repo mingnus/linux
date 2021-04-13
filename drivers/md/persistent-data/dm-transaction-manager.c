@@ -247,7 +247,7 @@ int dm_tm_new_block(struct dm_transaction_manager *tm,
 
 	r = dm_bm_write_lock_zero(tm->bm, new_block, v, result);
 	if (r < 0) {
-		dm_sm_dec_block(tm->sm, new_block);
+		dm_sm_dec_blocks(tm->sm, new_block, new_block + 1);
 		return r;
 	}
 
@@ -272,7 +272,7 @@ static int __shadow_block(struct dm_transaction_manager *tm, dm_block_t orig,
 	if (r < 0)
 		return r;
 
-	r = dm_sm_dec_block(tm->sm, orig);
+	r = dm_sm_dec_blocks(tm->sm, orig, orig + 1);
 	if (r < 0)
 		return r;
 
@@ -355,9 +355,20 @@ void dm_tm_inc(struct dm_transaction_manager *tm, dm_block_t b)
 	 */
 	BUG_ON(tm->is_clone);
 
-	dm_sm_inc_block(tm->sm, b);
+	dm_sm_inc_blocks(tm->sm, b, b + 1);
 }
 EXPORT_SYMBOL_GPL(dm_tm_inc);
+
+void dm_tm_inc_range(struct dm_transaction_manager *tm, dm_block_t b, dm_block_t e)
+{
+	/*
+	 * The non-blocking clone doesn't support this.
+	 */
+	BUG_ON(tm->is_clone);
+
+	dm_sm_inc_blocks(tm->sm, b, e);
+}
+EXPORT_SYMBOL_GPL(dm_tm_inc_range);
 
 void dm_tm_dec(struct dm_transaction_manager *tm, dm_block_t b)
 {
@@ -366,9 +377,50 @@ void dm_tm_dec(struct dm_transaction_manager *tm, dm_block_t b)
 	 */
 	BUG_ON(tm->is_clone);
 
-	dm_sm_dec_block(tm->sm, b);
+	dm_sm_dec_blocks(tm->sm, b, b + 1);
 }
 EXPORT_SYMBOL_GPL(dm_tm_dec);
+
+void dm_tm_dec_range(struct dm_transaction_manager *tm, dm_block_t b, dm_block_t e)
+{
+	/*
+	 * The non-blocking clone doesn't support this.
+	 */
+	BUG_ON(tm->is_clone);
+
+	dm_sm_dec_blocks(tm->sm, b, e);
+}
+EXPORT_SYMBOL_GPL(dm_tm_dec_range);
+
+void dm_tm_with_runs(struct dm_transaction_manager *tm,
+                     const __le64 *value_le, unsigned count, dm_tm_run_fn fn)
+{
+	uint64_t b, begin, end;
+	bool in_run = false;
+	unsigned i;
+
+	for (i = 0; i < count; i++, value_le++) {
+		b = le64_to_cpu(*value_le);
+
+		if (in_run) {
+			if (b == end)
+				end++;
+			else {
+				fn(tm, begin, end);
+				begin = b;
+				end = b + 1;
+			}
+		} else {
+			in_run = true;
+			begin = b;
+			end = b + 1;
+		}
+	}
+
+	if (in_run)
+		fn(tm, begin, end);
+}
+EXPORT_SYMBOL_GPL(dm_tm_with_runs);
 
 int dm_tm_ref(struct dm_transaction_manager *tm, dm_block_t b,
 	      uint32_t *result)
