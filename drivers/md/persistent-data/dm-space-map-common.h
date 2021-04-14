@@ -114,12 +114,40 @@ struct disk_bitmap_header {
 
 /*----------------------------------------------------------------*/
 
+/*
+ * We must never touch the metadata from the previous transaction.
+ * This means if we free a metadata block then we must be careful not
+ * to reuse it within the same transaction.
+ * 
+ * We use a small (4k) bloom filter to keep track of blocks that have
+ * been freed.  This will cope with around 3000 entries with a false
+ * positive rate of 1%, which will be more than enough for the majority
+ * of transactions.  Deleting a thin or large discards may free off
+ * huge numbers of blocks, so if the 3000 limit is broken we then fall
+ * back to reading the space map from the prior transaction.
+ */
+
+struct bloom_filter {
+	unsigned nr_entries;
+	void *bits;
+};
+
+int bf_alloc(struct bloom_filter *bf);
+void bf_free(struct bloom_filter *bf);
+void bf_reset(struct bloom_filter *bf);
+bool bf_is_full(struct bloom_filter *bf);
+void bf_insert(struct bloom_filter *bf, dm_block_t b);
+bool bf_lookup(struct bloom_filter *bf, dm_block_t b);
+
+/*----------------------------------------------------------------*/
+
 int sm_ll_extend(struct ll_disk *ll, dm_block_t extra_blocks);
 int sm_ll_lookup_bitmap(struct ll_disk *ll, dm_block_t b, uint32_t *result);
 int sm_ll_lookup(struct ll_disk *ll, dm_block_t b, uint32_t *result);
 int sm_ll_find_free_block(struct ll_disk *ll, dm_block_t begin,
 			  dm_block_t end, dm_block_t *result);
 int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
+                                 struct bloom_filter *recent_frees,
 	                         dm_block_t begin, dm_block_t end, dm_block_t *result);
 
 /*
@@ -127,9 +155,9 @@ int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
  * allocations that were made.  This number may be negative if there were
  * more frees than allocs.
  */
-int sm_ll_insert(struct ll_disk *ll, dm_block_t b, uint32_t ref_count, int32_t *nr_allocations);
+int sm_ll_insert(struct ll_disk *ll, dm_block_t b, uint32_t ref_count, bool bm_forget, int32_t *nr_allocations);
 int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations);
-int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations);
+int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e, bool bm_forget, int32_t *nr_allocations);
 int sm_ll_commit(struct ll_disk *ll);
 
 int sm_ll_new_metadata(struct ll_disk *ll, struct dm_transaction_manager *tm);

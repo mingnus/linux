@@ -613,6 +613,29 @@ void dm_bm_prefetch(struct dm_block_manager *bm, dm_block_t b)
 {
 	dm_bufio_prefetch(bm->bufio, b, 1);
 }
+EXPORT_SYMBOL_GPL(dm_bm_prefetch);
+
+void dm_bm_forget(struct dm_block_manager *bm, dm_block_t b)
+{
+	dm_bufio_forget(bm->bufio, b);
+}
+EXPORT_SYMBOL_GPL(dm_bm_forget);
+
+void dm_bm_unlock_move(struct dm_block_manager *bm,
+                       struct dm_block *b, dm_block_t new_location)
+{
+	struct buffer_aux *aux;
+	aux = dm_bufio_get_aux_data(to_buffer(b));
+
+	if (aux->write_locked) {
+		dm_bufio_mark_buffer_dirty(to_buffer(b));
+		bl_up_write(&aux->lock);
+	} else
+		bl_up_read(&aux->lock);
+
+	dm_bufio_release_move(to_buffer(b), new_location);
+}
+EXPORT_SYMBOL_GPL(dm_bm_unlock_move);
 
 bool dm_bm_is_read_only(struct dm_block_manager *bm)
 {

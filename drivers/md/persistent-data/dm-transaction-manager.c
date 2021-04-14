@@ -262,6 +262,7 @@ int dm_tm_new_block(struct dm_transaction_manager *tm,
 
 static int __shadow_block(struct dm_transaction_manager *tm, dm_block_t orig,
 			  struct dm_block_validator *v,
+                          bool use_move,
 			  struct dm_block **result)
 {
 	int r;
@@ -280,24 +281,21 @@ static int __shadow_block(struct dm_transaction_manager *tm, dm_block_t orig,
 	if (r < 0)
 		return r;
 
-	/*
-	 * It would be tempting to use dm_bm_unlock_move here, but some
-	 * code, such as the space maps, keeps using the old data structures
-	 * secure in the knowledge they won't be changed until the next
-	 * transaction.  Using unlock_move would force a synchronous read
-	 * since the old block would no longer be in the cache.
-	 */
-	r = dm_bm_write_lock_zero(tm->bm, new, v, result);
-	if (r) {
+	if (use_move) {
+		dm_bm_unlock_move(tm->bm, orig_block, new);
+		return dm_bm_write_lock(tm->bm, new, v, result);
+	} else {
+		r = dm_bm_write_lock_zero(tm->bm, new, v, result);
+		if (r) {
+		       dm_bm_unlock(orig_block);
+		       return r;
+		}
+	
+		memcpy(dm_block_data(*result), dm_block_data(orig_block),
+		      dm_bm_block_size(tm->bm));
 		dm_bm_unlock(orig_block);
-		return r;
+		return 0;
 	}
-
-	memcpy(dm_block_data(*result), dm_block_data(orig_block),
-	       dm_bm_block_size(tm->bm));
-
-	dm_bm_unlock(orig_block);
-	return r;
 }
 
 int dm_tm_shadow_block(struct dm_transaction_manager *tm, dm_block_t orig,
@@ -316,7 +314,7 @@ int dm_tm_shadow_block(struct dm_transaction_manager *tm, dm_block_t orig,
 	if (is_shadow(tm, orig) && !*inc_children)
 		return dm_bm_write_lock(tm->bm, orig, v, result);
 
-	r = __shadow_block(tm, orig, v, result);
+	r = __shadow_block(tm, orig, v, !*inc_children, result);
 	if (r < 0)
 		return r;
 	insert_shadow(tm, dm_block_location(*result));

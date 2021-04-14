@@ -26,6 +26,7 @@ struct sm_disk {
 
 	struct ll_disk ll;
 	struct ll_disk old_ll;
+	struct bloom_filter recent_frees;
 
 	dm_block_t begin;
 	dm_block_t nr_allocated_this_transaction;
@@ -90,7 +91,7 @@ static int sm_disk_set_count(struct dm_space_map *sm, dm_block_t b,
 	int32_t nr_allocations;
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 
-	r = sm_ll_insert(&smd->ll, b, count, &nr_allocations);
+	r = sm_ll_insert(&smd->ll, b, count, false, &nr_allocations);
 	if (!r) {
 		smd->nr_allocated_this_transaction += nr_allocations;
 	}
@@ -117,7 +118,7 @@ static int sm_disk_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t 
 	int32_t nr_allocations;
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 
-	r = sm_ll_dec(&smd->ll, b, e, &nr_allocations);
+	r = sm_ll_dec(&smd->ll, b, e, false, &nr_allocations);
 	if (!r)
 		smd->nr_allocated_this_transaction += nr_allocations;
 
@@ -133,13 +134,13 @@ static int sm_disk_new_block(struct dm_space_map *sm, dm_block_t *b)
 	/*
 	 * Any block we allocate has to be free in both the old and current ll.
 	 */
-	r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, smd->begin, smd->ll.nr_blocks, b);
+	r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, &smd->recent_frees, smd->begin, smd->ll.nr_blocks, b);
 	if (r == -ENOSPC) {
 		/*
 	         * There's no free block between smd->begin and the end of the metadata device.
 	         * We search before smd->begin in case something has been freed.
 	         */
-		r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, 0, smd->begin, b);
+		r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, &smd->recent_frees, 0, smd->begin, b);
 	}
 
 	if (r)
@@ -164,6 +165,7 @@ static int sm_disk_commit(struct dm_space_map *sm)
 		return r;
 
 	memcpy(&smd->old_ll, &smd->ll, sizeof(smd->old_ll));
+	bf_reset(&smd->recent_frees);
 	smd->nr_allocated_this_transaction = 0;
 
 	return 0;
@@ -227,6 +229,12 @@ struct dm_space_map *dm_sm_disk_create(struct dm_transaction_manager *tm,
 	smd->nr_allocated_this_transaction = 0;
 	memcpy(&smd->sm, &ops, sizeof(smd->sm));
 
+	r = bf_alloc(&smd->recent_frees);
+	if (r) {
+		kfree(smd);
+		return ERR_PTR(r);
+	}
+
 	r = sm_ll_new_disk(&smd->ll, tm);
 	if (r)
 		goto bad;
@@ -242,6 +250,7 @@ struct dm_space_map *dm_sm_disk_create(struct dm_transaction_manager *tm,
 	return &smd->sm;
 
 bad:
+	bf_free(&smd->recent_frees);
 	kfree(smd);
 	return ERR_PTR(r);
 }
@@ -260,6 +269,11 @@ struct dm_space_map *dm_sm_disk_open(struct dm_transaction_manager *tm,
 	smd->begin = 0;
 	smd->nr_allocated_this_transaction = 0;
 	memcpy(&smd->sm, &ops, sizeof(smd->sm));
+	r = bf_alloc(&smd->recent_frees);
+	if (r) {
+		kfree(smd);
+		return ERR_PTR(r);
+	}
 
 	r = sm_ll_open_disk(&smd->ll, tm, root_le, len);
 	if (r)
@@ -272,6 +286,7 @@ struct dm_space_map *dm_sm_disk_open(struct dm_transaction_manager *tm,
 	return &smd->sm;
 
 bad:
+	bf_free(&smd->recent_frees);
 	kfree(smd);
 	return ERR_PTR(r);
 }

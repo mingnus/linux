@@ -113,6 +113,23 @@ int dm_bm_flush(struct dm_block_manager *bm);
 void dm_bm_prefetch(struct dm_block_manager *bm, dm_block_t b);
 
 /*
+ * Provide a hint to the block manager that you've finished with
+ * this block so it's memory may be reclaimed.  Ignored if
+ * the block contains unflushed changes.
+ */
+void dm_bm_forget(struct dm_block_manager *bm, dm_block_t b);
+
+/*
+ * Unlocks a block, and places a copy of it in the new location.  If
+ * there are no other holders of the block then the new location will
+ * be cache (zero copy), and any access to the old location will likely
+ * trigger a read.  Very helpful when shadowing blocks whose ref_count is
+ * one.
+ */
+void dm_bm_unlock_move(struct dm_block_manager *bm,
+                       struct dm_block *b, dm_block_t new_location);
+
+/*
  * Switches the bm to a read only mode.  Once read-only mode
  * has been entered the following functions will return -EPERM.
  *

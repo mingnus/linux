@@ -16,6 +16,71 @@
 
 /*----------------------------------------------------------------*/
 
+#define BF_BYTES 4096
+#define BF_MASK ((BF_BYTES * 8) - 1)
+#define BF_MAX_ENTRIES 3000
+
+int bf_alloc(struct bloom_filter *bf)
+{
+	bf->nr_entries = 0;
+	// FIXME: is this the best way to get a page?
+	bf->bits = kmalloc(BF_BYTES, GFP_KERNEL);
+	if (!bf->bits)
+		return -ENOMEM;
+	return 0;
+}
+
+void bf_free(struct bloom_filter *bf)
+{
+	kfree(bf->bits);
+}
+
+void bf_reset(struct bloom_filter *bf)
+{
+	bf->nr_entries = 0;
+	memset(bf->bits, 0, BF_BYTES);
+}
+
+bool bf_is_full(struct bloom_filter *bf)
+{
+	return bf->nr_entries >= BF_MAX_ENTRIES;
+}
+
+void bf_insert(struct bloom_filter *bf, dm_block_t b)
+{
+	uint32_t p1, p2, p3, p4;
+	
+	if (bf_is_full(bf))
+		return;
+
+	// We're using 4 probes
+	// FIXME: work out some decent hash functions
+	p1 = dm_hash_block(b, BF_MASK);
+	p2 = dm_hash_block(b * 7, BF_MASK);
+	p3 = dm_hash_block(b * 11, BF_MASK);
+	p4 = dm_hash_block(b * 13, BF_MASK);
+
+	set_bit(p1, bf->bits);
+	set_bit(p2, bf->bits);
+	set_bit(p3, bf->bits);
+	set_bit(p4, bf->bits);
+}
+
+bool bf_lookup(struct bloom_filter *bf, dm_block_t b)
+{
+	uint32_t p1 = dm_hash_block(b, BF_MASK);
+	uint32_t p2 = dm_hash_block(b * 7, BF_MASK);
+	uint32_t p3 = dm_hash_block(b * 11, BF_MASK);
+	uint32_t p4 = dm_hash_block(b * 13, BF_MASK);
+
+	return test_bit(p1, bf->bits) &&
+		test_bit(p2, bf->bits) &&
+		test_bit(p3, bf->bits) &&
+		test_bit(p4, bf->bits);
+}
+
+/*----------------------------------------------------------------*/
+
 /*
  * Index validator.
  */
@@ -385,28 +450,42 @@ int sm_ll_find_free_block(struct ll_disk *ll, dm_block_t begin,
 }
 
 int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
+                                 struct bloom_filter *recent_frees,
 	                         dm_block_t begin, dm_block_t end, dm_block_t *b)
 {
 	int r;
-	uint32_t count;
 
-	do {
+	for (; begin != end; begin++) {
 		r = sm_ll_find_free_block(new_ll, begin, new_ll->nr_blocks, b);
 		if (r)
 			break;
 
 		/* double check this block wasn't used in the old transaction */
-		if (*b >= old_ll->nr_blocks)
-			count = 0;
-		else {
-			r = sm_ll_lookup(old_ll, *b, &count);
-			if (r)
-				break;
+		if (bf_lookup(recent_frees, *b))
+			continue;
 
-			if (count)
-				begin = *b + 1;
-		}
-	} while (count);
+		if (bf_is_full(recent_frees)) {
+			/*
+                         * We can't rely on bf_lookup, so we fall back to reading the
+                         * old space map.
+                         */
+			uint32_t count;
+			if (*b >= old_ll->nr_blocks)
+				break;
+			else {
+				r = sm_ll_lookup(old_ll, *b, &count);
+				if (r)
+					break;
+
+				if (!count)
+					break;
+			}
+		} else
+			break;
+	}
+
+	if (begin == end)
+		return -ENOSPC;
 
 	return r;
 }
@@ -414,7 +493,7 @@ int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
 /*----------------------------------------------------------------*/
 
 int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
-		 uint32_t ref_count, int32_t *nr_allocations)
+		 uint32_t ref_count, bool bm_forget, int32_t *nr_allocations)
 {
 	int r;
 	uint32_t bit, old;
@@ -491,6 +570,8 @@ int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
 		ll->nr_allocated--;
 		le32_add_cpu(&ie_disk.nr_free, 1);
 		ie_disk.none_free_before = cpu_to_le32(min(le32_to_cpu(ie_disk.none_free_before), bit));
+		if (bm_forget)
+			dm_bm_forget(dm_tm_get_bm(ll->tm), b);
 	} else
 		*nr_allocations = 0;
 
@@ -831,7 +912,7 @@ static int sm_ll_dec_overflow(struct ll_disk *ll, dm_block_t b,
  * Loops round incrementing entries in a single bitmap.
  */
 static inline int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, uint32_t bit, uint32_t bit_end,
-                              struct inc_context *ic,
+                              bool bm_forget, struct inc_context *ic,
 		              int32_t *nr_allocations, dm_block_t *new_b)
 {
 	int r;
@@ -860,6 +941,8 @@ static inline int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, uint32_t bit, ui
 			ll->nr_allocated--;
 			le32_add_cpu(&ic->ie_disk.nr_free, 1);
 			ic->ie_disk.none_free_before = cpu_to_le32(min(le32_to_cpu(ic->ie_disk.none_free_before), bit));
+			if (bm_forget)
+				dm_bm_forget(dm_tm_get_bm(ll->tm), b);
 			break;
 
 		case 2:
@@ -889,6 +972,7 @@ static inline int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, uint32_t bit, ui
 
 
 static int sm_ll_dec_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
+                      bool bm_forget,
 		      int32_t *nr_allocations, dm_block_t *new_b)
 {
 	int r;
@@ -908,7 +992,7 @@ static int sm_ll_dec_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		return r;
 
 	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
-	r = sm_ll_dec__(ll, b, bit, bit_end, &ic, nr_allocations, new_b);
+	r = sm_ll_dec__(ll, b, bit, bit_end, bm_forget, &ic, nr_allocations, new_b);
 	exit_inc_context(ll, &ic);
 
 	if (r)
@@ -918,11 +1002,11 @@ static int sm_ll_dec_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 }
 
 int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e,
-	      int32_t *nr_allocations)
+	      bool bm_forget, int32_t *nr_allocations)
 {
 	*nr_allocations = 0;
 	while (b != e) {
-		int r = sm_ll_dec_(ll, b, e, nr_allocations, &b);
+		int r = sm_ll_dec_(ll, b, e, bm_forget, nr_allocations, &b);
 		if (r)
 			return r;
 	}
@@ -1214,7 +1298,7 @@ int sm_ll_new_disk(struct ll_disk *ll, struct dm_transaction_manager *tm)
 		return r;
 
 	r = dm_btree_empty(&ll->ref_count_info, &ll->ref_count_root);
-	if (r < 0)
+	if (r < 0) 
 		return r;
 
 	return 0;

@@ -15,6 +15,8 @@
 
 #define DM_MSG_PREFIX "space map metadata"
 
+#define USE_FORGET true
+
 /*----------------------------------------------------------------*/
 
 /*
@@ -168,6 +170,7 @@ struct sm_metadata {
 
 	struct ll_disk ll;
 	struct ll_disk old_ll;
+	struct bloom_filter recent_frees;
 
 	dm_block_t begin;
 
@@ -200,7 +203,7 @@ static int commit_bop(struct sm_metadata *smm, struct block_op *op)
 		break;
 
 	case BOP_DEC:
-		r = sm_ll_dec(&smm->ll, op->b, op->e, &nr_allocations);
+		r = sm_ll_dec(&smm->ll, op->b, op->e, USE_FORGET, &nr_allocations);
 		break;
 	}
 
@@ -401,7 +404,7 @@ static int sm_metadata_set_count(struct dm_space_map *sm, dm_block_t b,
 	}
 
 	in(smm);
-	r = sm_ll_insert(&smm->ll, b, count, &nr_allocations);
+	r = sm_ll_insert(&smm->ll, b, count, USE_FORGET, &nr_allocations);
 	r2 = out(smm);
 
 	return combine_errors(r, r2);
@@ -436,7 +439,7 @@ static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 		r = add_bop(smm, BOP_DEC, b, e);
 	else {
 		in(smm);
-		r = sm_ll_dec(&smm->ll, b, e, &nr_allocations);
+		r = sm_ll_dec(&smm->ll, b, e, USE_FORGET, &nr_allocations);
 		r2 = out(smm);
 	}
 
@@ -452,13 +455,13 @@ static int sm_metadata_new_block_(struct dm_space_map *sm, dm_block_t *b)
 	/*
 	 * Any block we allocate has to be free in both the old and current ll.
 	 */
-	r = sm_ll_find_common_free_block(&smm->old_ll, &smm->ll, smm->begin, smm->ll.nr_blocks, b);
+	r = sm_ll_find_common_free_block(&smm->old_ll, &smm->ll, &smm->recent_frees, smm->begin, smm->ll.nr_blocks, b);
 	if (r == -ENOSPC) {
 		/*
                  * There's no free block between smm->begin and the end of the metadata device.
                  * We search before smm->begin in case something has been freed.
                  */
-		r = sm_ll_find_common_free_block(&smm->old_ll, &smm->ll, 0, smm->begin, b);
+		r = sm_ll_find_common_free_block(&smm->old_ll, &smm->ll, &smm->recent_frees, 0, smm->begin, b);
 	}
 
 	if (r)
@@ -512,6 +515,7 @@ static int sm_metadata_commit(struct dm_space_map *sm)
 		return r;
 
 	memcpy(&smm->old_ll, &smm->ll, sizeof(smm->old_ll));
+	bf_reset(&smm->recent_frees);
 	smm->allocated_this_transaction = 0;
 
 	return 0;
@@ -766,14 +770,20 @@ out:
 
 struct dm_space_map *dm_sm_metadata_init(void)
 {
+	int r;
 	struct sm_metadata *smm;
 
 	smm = kmalloc(sizeof(*smm), GFP_KERNEL);
 	if (!smm)
 		return ERR_PTR(-ENOMEM);
 
-	memcpy(&smm->sm, &ops, sizeof(smm->sm));
+	r = bf_alloc(&smm->recent_frees);
+	if (r) {
+		kfree(smm);
+		return ERR_PTR(r);
+	}
 
+	memcpy(&smm->sm, &ops, sizeof(smm->sm));
 	return &smm->sm;
 }
 
