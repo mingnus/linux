@@ -180,7 +180,7 @@ static void prefetch_children(struct del_stack *s, struct frame *f)
 	struct internal_node *n = dm_block_data(f->b);
 
 	for (i = 0; i < f->nr_children; i++)
-		dm_bm_prefetch(bm, n->values[i]);
+		dm_bm_prefetch(bm, le64_to_cpu(n->values[i]));
 }
 
 static int push_frame(struct del_stack *s, dm_block_t b)
@@ -250,6 +250,8 @@ int dm_rtree_del(struct dm_transaction_manager *tm, struct dm_space_map *data_sm
 	int r;
 	struct del_stack *s;
 
+	pr_alert("dm_rtree_del");
+
 	/*
 	 * This is called via an ioctl, as such should be * considered an FS op.
          * We can't recurse back into the FS, so we * allocate GFP_NOFS.
@@ -283,7 +285,7 @@ int dm_rtree_del(struct dm_transaction_manager *tm, struct dm_space_map *data_sm
 		flags = le32_to_cpu(h->flags);
 		if (flags & INTERNAL_NODE) {
 			struct internal_node *n = (struct internal_node *) h;
-			b = n->values[f->current_child++];
+			b = le64_to_cpu(n->values[f->current_child++]);
 			r = push_frame(s, b);
 			if (r)
 				goto out;
@@ -295,7 +297,9 @@ int dm_rtree_del(struct dm_transaction_manager *tm, struct dm_space_map *data_sm
 				struct disk_mapping *m = n->values + i;
 				dm_block_t data_begin = le64_to_cpu(m->data_begin);
 				dm_block_t data_end = data_begin + le32_to_cpu(m->len);
-				dm_sm_dec_blocks(data_sm, data_begin, data_end);
+				r = dm_sm_dec_blocks(data_sm, data_begin, data_end);
+				if (r)
+					return r;
 			}
 
 			pop_frame(s);
@@ -431,11 +435,11 @@ static int exit_shadow_spine(struct shadow_spine *s)
 	return 0;
 }
 
-static void inc_children(struct dm_transaction_manager *tm,
-                         struct dm_space_map *data_sm,
-                         struct dm_block *b)
+static int inc_children(struct dm_transaction_manager *tm,
+                        struct dm_space_map *data_sm,
+                        struct dm_block *b)
 {
-	unsigned i;
+	unsigned i, r;
 	struct node_header *h = dm_block_data(b);
 
 	uint32_t flags = le32_to_cpu(h->flags);
@@ -444,7 +448,7 @@ static void inc_children(struct dm_transaction_manager *tm,
 	if (flags & INTERNAL_NODE) {
 		struct internal_node *n = (struct internal_node *) h;
 		for (i = 0; i < nr_entries; i++)
-			dm_tm_inc(tm, n->values[i]);
+			dm_tm_inc(tm, le64_to_cpu(n->values[i]));
 
 	} else {
 		struct leaf_node *n = (struct leaf_node *) h;
@@ -453,9 +457,13 @@ static void inc_children(struct dm_transaction_manager *tm,
 			struct disk_mapping *m = n->values + i;
 			dm_block_t data_begin = le64_to_cpu(m->data_begin);
 			dm_block_t data_end = data_begin + le32_to_cpu(m->len);
-			dm_sm_inc_blocks(data_sm, data_begin, data_end);
+			r = dm_sm_inc_blocks(data_sm, data_begin, data_end);
+			if (r)
+				return r;
 		}
 	}
+
+	return 0;
 }
 
 static int shadow_step(struct shadow_spine *s, dm_block_t b)
@@ -836,7 +844,7 @@ static int split_two_into_three(struct shadow_spine *s, unsigned parent_index, d
 /*
  * Splits a node by creating two new children beneath the given node.
  */
-static int split_beneath(struct shadow_spine *s, uint64_t key)
+static int split_beneath_leaf(struct shadow_spine *s, uint64_t key)
 {
 	int r;
 	unsigned nr_left, nr_right;
@@ -891,6 +899,74 @@ static int split_beneath(struct shadow_spine *s, uint64_t key)
 	dm_tm_unlock(s->tm, left);
 	dm_tm_unlock(s->tm, right);
 	return 0;
+}
+
+static int split_beneath_internal(struct shadow_spine *s, uint64_t key)
+{
+	int r;
+	unsigned nr_left, nr_right;
+	struct dm_block *left, *right, *new_parent;
+	struct internal_node *pn, *ln, *rn;
+	struct internal_node *pn_i;
+
+	BUG_ON(s->count != 1);
+	new_parent = shadow_current(s);
+
+	pn = dm_block_data(new_parent);
+
+	/* create & init the left block */
+	r = dm_tm_new_block(s->tm, &validator, &left);
+	if (r < 0)
+		return r;
+
+	ln = dm_block_data(left);
+	nr_left = le32_to_cpu(pn->header.nr_entries) / 2;
+
+	ln->header.flags = pn->header.flags;
+	ln->header.nr_entries = cpu_to_le32(nr_left);
+	memcpy(ln->keys, pn->keys, nr_left * sizeof(pn->keys[0]));
+	memcpy(ln->values, pn->values, nr_left * sizeof(pn->values[0]));
+
+	/* create & init the right block */
+	r = dm_tm_new_block(s->tm, &validator, &right);
+	if (r < 0) {
+		dm_tm_unlock(s->tm, left);
+		return r;
+	}
+
+	rn = dm_block_data(right);
+	nr_right = le32_to_cpu(pn->header.nr_entries) - nr_left;
+
+	rn->header.flags = pn->header.flags;
+	rn->header.nr_entries = cpu_to_le32(nr_right);
+	memcpy(rn->keys, pn->keys + nr_left, nr_right * sizeof(pn->keys[0]));
+	memcpy(rn->values, pn->values + nr_left, nr_right * sizeof(pn->values[0]));
+
+	/* new_parent should just point to l and r now */
+	pn_i = (struct internal_node *) pn;
+	pn_i->header.flags = cpu_to_le32(INTERNAL_NODE);
+	pn_i->header.nr_entries = cpu_to_le32(2);
+
+	pn_i->keys[0] = ln->keys[0];
+	pn_i->values[0] = cpu_to_le64(dm_block_location(left));
+	
+	pn_i->keys[1] = rn->keys[0];
+	pn_i->values[1] = cpu_to_le64(dm_block_location(right));
+	
+	dm_tm_unlock(s->tm, left);
+	dm_tm_unlock(s->tm, right);
+	return 0;
+}
+
+static int split_beneath(struct shadow_spine *s, uint64_t key)
+{
+	struct node_header *h = dm_block_data(shadow_current(s));
+	uint32_t flags = le32_to_cpu(h->flags);
+	if (flags == LEAF_NODE) {
+		return split_beneath_leaf(s, key);
+	} else {
+		return split_beneath_internal(s, key);
+	}
 }
 
 /*
@@ -993,7 +1069,6 @@ static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b, 
 #define SPACE_THRESHOLD 8
 static int rebalance_or_split(struct shadow_spine *s, unsigned parent_index, uint64_t key)
 {
-#if 1
 	int r;
 	struct internal_node *pn = dm_block_data(shadow_parent(s));
 	unsigned nr_parent = le32_to_cpu(pn->header.nr_entries);
@@ -1046,9 +1121,6 @@ static int rebalance_or_split(struct shadow_spine *s, unsigned parent_index, uin
 	} else {
 		return split_two_into_three(s, parent_index, key);
 	}
-#else
-	return split_one_into_two(s, parent_index, key);
-#endif
 }
 
 static bool has_space_for_insert(struct node_header *h, uint64_t key)
@@ -1121,82 +1193,6 @@ static int find_leaf_(struct shadow_spine *s, dm_block_t root, dm_block_t key, i
 	return 0;
 }
 
-#if 0
-// FIXME: this is too general, atm we run remove on the range first,
-// so we know there's no overlap.
-/*
- * Merges up to 2 mappings.  thin_begin of first mapping must be <= that
- * of second.  Returns the resulting number of mappings.  An overlap can
- * cause the first mapping to be truncated (the second mapping takes
- * precedence).  If the second mapping is within the first then that
- * can result in 3 mappings, so ms must have at least this much space.
- */
-// FIXME: unit test
-static unsigned merge_mappings(struct dm_mapping *ms,
-	                       struct dm_space_map *data_sm)
-{
-	uint64_t thin_delta = ms[1].thin_begin - ms[0].thin_begin;
-
-	if (thin_delta > ms[0].len) {
-		/* separate ranges */
-		return 2;
-
-	} else if (thin_delta == ms[0].len) {
-		/* adjacent ranges */
-		if ((ms[0].data_begin + (uint64_t) ms[0].len == ms[1].data_begin) &&
-                    (ms[0].time == ms[1].time)) {
-			/* merge into one */
-			ms[0].len += ms[1].len;
-			return 1;
-		} else {
-			/* must keep separate */
-			return 2;
-		}
-	} else if (ms[1].thin_begin + ms[1].len < ms[0].thin_begin + ms[0].len) {
-		/* ms[1] is entirely within ms[0] */
-		if ((ms[0].data_begin + thin_delta == ms[1].data_begin) &&
-                    (ms[0].time == ms[1].time)) {
-	                    /*
-                             * Overwriting with same mapping, so just need to
-                             * decrement ref counts.
-                             */
-                            dm_sm_dec_blocks(data_sm, ms[1].data_begin, ms[1].data_begin + ms[1].len);
-                            return 1;
-		} else {
-			/* split into three */
-			dm_sm_dec_blocks(data_sm,
-                                         ms[0].data_begin + thin_delta,
-                                         ms[0].data_begin + thin_delta + ms[1].len);
-			
-			ms[2].thin_begin = ms[0].thin_begin + thin_delta + ms[1].len;
-			ms[2].data_begin = ms[0].data_begin + thin_delta + ms[1].len;
-			ms[2].time = ms[0].time;
-			ms[0].len = thin_delta;
-			return 3;
-		}
-	} else {
-		/* overlapping ranges */
-		if ((ms[0].data_begin + thin_delta == ms[1].data_begin) &&
-                    (ms[0].time == ms[1].time)) {
-	                    /*
-                             * This is a strange case where we overwrite with the same
-                             * mappings.  Need to handle it though.
-                             */
-                             dm_sm_dec_blocks(data_sm, ms[0].data_begin + thin_delta,
-                                              ms[0].data_begin + (uint32_t) ms[0].len);
-                             ms[0].len = (uint32_t) thin_delta + ms[1].len;
-                             return 1;
-		} else {
-			/* truncate the first mapping, but keep them separate */
-			dm_sm_dec_blocks(data_sm, ms[0].data_begin + thin_delta,
-                                         ms[0].data_begin + (uint32_t) ms[0].len);
-			ms[0].len = (uint32_t) thin_delta;
-			return 2;
-		}
-	}
-}
-#endif
-
 static bool adjacent_mapping(struct dm_mapping *left, struct dm_mapping *right)
 {
 	uint64_t thin_delta = right->thin_begin - left->thin_begin;
@@ -1211,7 +1207,6 @@ static int insert__(struct shadow_spine *spine,
                     dm_block_t root,
                     struct dm_mapping *value, dm_block_t *new_root, unsigned *nr_inserts)
 {
-#if 1
 	int r;
 	int index;
 	dm_block_t block = root;
@@ -1296,38 +1291,6 @@ static int insert__(struct shadow_spine *spine,
 
 	*new_root = shadow_root(spine);
 	return 0;
-#else
-	/*
-         * Version with no merging.
-         */
-	int r;
-	int index;
-	dm_block_t block = root;
-	struct leaf_node *n;
-	uint32_t nr_entries;
-
-	r = find_leaf_(spine, block, value->thin_begin, &index);
-	if (r < 0)
-		return r;
-
-	n = dm_block_data(shadow_current(spine));
-	nr_entries = le32_to_cpu(n->header.nr_entries);
-
-	if (nr_entries == 0) {
-		insert_into_leaf(n, 0, value);
-	} else if (index < 0) {
-		/* new entry goes at start */
-		insert_into_leaf(n, 0, value);
-	} else if (index == nr_entries - 1) {
-		insert_into_leaf(n, index + 1, value);
-	} else {
-		// insert_into_leaf(n, index + 1, value);
-		insert_into_leaf(n, index + 1, value);
-	}
-
-	*new_root = shadow_root(spine);
-	return 0;
-#endif
 }
 
 static int insert_(struct dm_transaction_manager *tm,
@@ -1348,16 +1311,13 @@ int dm_rtree_insert(struct dm_transaction_manager *tm,
                     dm_block_t root,
                     struct dm_mapping *value, dm_block_t *new_root, unsigned *nr_inserts)
 {
-	// Commented out for now to simplify testing
-#if 0
 	int r = dm_rtree_remove(tm, data_sm, root,
                                 value->thin_begin, value->thin_begin + value->len,
                                 new_root);
 	if (r)
 		return r;
-#endif
 
-	return insert_(tm, root, value, new_root, nr_inserts);
+	return insert_(tm, *new_root, value, new_root, nr_inserts);
 }
 EXPORT_SYMBOL_GPL(dm_rtree_insert);
 
@@ -1376,13 +1336,13 @@ static void erase_internal_entry(struct internal_node *n, unsigned index)
 	memmove(n->values + index, n->values + index + 1, sizeof(n->values[0]));
 }
 
-static void erase_leaf_entry(struct leaf_node *n, unsigned index)
+static void erase_leaf_entries(struct leaf_node *n, unsigned index_b, unsigned index_e)
 {
-	n->header.nr_entries = cpu_to_le32(le32_to_cpu(n->header.nr_entries) - 1);
-	memmove(n->keys + index, n->keys + index + 1, sizeof(n->keys[0]));
-	memmove(n->values + index, n->values + index + 1, sizeof(n->values[0]));
+	n->header.nr_entries = cpu_to_le32(le32_to_cpu(n->header.nr_entries) - (index_e - index_b));
+	memmove(n->keys + index_b, n->keys + index_e, sizeof(n->keys[0]));
+	memmove(n->values + index_b, n->values + index_e, sizeof(n->values[0]));
 }
-                                
+
 /*
  * We make no attempt to rebalance the nodes after the remove.  Now that
  * we're removing ranges it just gets too complicated.  Instead we'll track
@@ -1400,41 +1360,49 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 {
 	struct internal_node *n = dm_block_data(block);
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
-	int i = lower_bound(n->keys, nr_entries, thin_begin);
+	int r, i = lower_bound(n->keys, nr_entries, thin_begin);
 	if (i < 0)
 		i = 0;
 
 	for (; i < nr_entries; i++) {
 		dm_block_t key = le64_to_cpu(n->keys[i]);
 		dm_block_t next_key;
+		dm_block_t child;
 
-		if (i == (nr_entries - 1))
-			next_key = n->header.node_end;
-		else
+		if (i == (nr_entries - 1)) {
+			// FIXME: node_end is error prone, so I'm going to just recurse for now.
+			remove_(tm, data_sm, le64_to_cpu(n->values[i]),
+                                block, i, thin_begin, thin_end, new_root);
+
+		} else {
 			next_key = le64_to_cpu(n->keys[i + 1]);
 
-		if (key >= thin_end)
-			break;
+			if (key >= thin_end)
+				break;
 
-		if (next_key <= thin_begin)
-			continue;
+			if (next_key <= thin_begin)
+				continue;
 
-		if (next_key <= thin_end) {
-			/* the whole entry is within the removal range, so we hand over to 
-                         * rtree_del.  FIXME: this mean _del can't call kmalloc, rewrite using
-                         * stack/recursion.
-                         */
-                        erase_internal_entry(n, i);
-                        {
-	                        dm_block_t b = dm_block_location(block);
-	                        dm_tm_unlock(tm, block);
-	                        dm_rtree_del(tm, data_sm, b); 
-                        }
-		} else {
-			/* There's an overlap, recurse into the child */
-			remove_(tm, data_sm, le64_to_cpu(n->values[i]),
-                                block, i,
-                                thin_begin, thin_end, new_root);
+			if (key >= thin_begin && next_key <= thin_end) {
+				/* the whole entry is within the removal range, so we hand over to 
+	                         * rtree_del.  FIXME: this mean _del can't call kmalloc, rewrite using
+	                         * stack/recursion.
+	                         */
+	                        // FIXME: repeated moves
+	  			child = le64_to_cpu(n->values[i]); 
+	                        erase_internal_entry(n, i);
+	                        {
+		                        dm_tm_unlock(tm, block);
+		                        r = dm_rtree_del(tm, data_sm, child); 
+		                        if (r)
+			                        return r;
+	                        }
+			} else {
+				/* There's an overlap, recurse into the child */
+				remove_(tm, data_sm, le64_to_cpu(n->values[i]),
+	                                block, i,
+	                                thin_begin, thin_end, new_root);
+			}
 		}
 	}
 
@@ -1448,42 +1416,125 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 	return 0;
 }
 
+/*
+ * Lot's of cases here.  An entry can be classified in relation to
+ * thin_begin and thin_end:
+ * 
+ *   a) entirely below (many)
+ *   b) overlap begin (single)
+ *   c) entirely within (many)
+ *   d) overlap end (single)
+ *   e) overlap begin and end (single)
+ *   f) entirely above (many)
+ * 
+ * Moving keys and values around is expensive, so we'd like to remove
+ * (c) cases all in one operation.
+ * 
+ * (e) will cause an entry to be split into two smaller entries.  So removing
+ * a range can increase the number of entries in the leaf, so we have to ensure
+ * there's space before calling this.
+ */
+ 
 static int remove_leaf_(struct dm_transaction_manager *tm,
                         struct dm_space_map *data_sm,
                         struct dm_block *block,
                         dm_block_t thin_begin, dm_block_t thin_end)
 {
+	int i, r;
+	unsigned within_start, within_end;
+	dm_block_t key;
+	struct disk_mapping *m;
+	uint32_t len;
 	struct leaf_node *n = dm_block_data(block);
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
-	int i = lower_bound(n->keys, nr_entries, thin_begin);
+
+	if (nr_entries == 0) {
+		pr_alert("no entries");
+		return 0;
+	}
+
+	i = lower_bound(n->keys, nr_entries, thin_begin);
 	if (i < 0)
 		i = 0;
 
-	for (; i < nr_entries; i++) {
-		dm_block_t key = le64_to_cpu(n->keys[i]);
-		struct disk_mapping *m = n->values + i;
-		uint32_t len = le32_to_cpu(m->len);
+	key = le64_to_cpu(n->keys[i]);
+	m = n->values + i;
+	len = le32_to_cpu(m->len);
 
-		if (key >= thin_end)
-			break;
+	if (key < thin_begin && (key + len) > thin_end) {
+		/* case e */
+		pr_alert("case e");
+		struct dm_mapping back_half;
+		back_half.thin_begin = thin_end;
+		back_half.data_begin = le64_to_cpu(m->data_begin) + (thin_end - thin_begin);
+		back_half.len = len - (thin_end - thin_begin);
+		back_half.time = m->time;
 
-		if (key + len <= thin_begin)
-			continue;
+		/* truncate the front half */
+		m->len = cpu_to_le32(thin_begin - key);
 
-		if (key + len <= thin_end) {
-			/* the whole entry is within the removal range, so we just remove it */
-                        dm_block_t data_begin = le64_to_cpu(m->data_begin);
-                        dm_block_t data_end = data_begin + le32_to_cpu(m->len);
-                        dm_sm_dec_blocks(data_sm, data_begin, data_end);
-
-                        // FIXME: repeated moves.
-                        erase_leaf_entry(n, i);
-		} else {
-			/* There's an overlap */
-			dm_block_t data_begin = le64_to_cpu(m->data_begin) + (thin_begin - key);
-			dm_block_t data_end = le64_to_cpu(m->data_begin) + le32_to_cpu(m->len);
-			dm_sm_dec_blocks(data_sm, data_begin, data_end);
+		/* insert new back half entry */
+		insert_into_leaf(n, i + 1, &back_half);
+	} else {
+		if (key + len <= thin_begin) {
+			/* case a */
+			i++;
+		} else if ((key < thin_begin)) {
+			/* case b */
+			pr_alert("case b");
+			dm_block_t delta = thin_begin - key;
+			dm_block_t data_begin = le64_to_cpu(m->data_begin + delta);
+			dm_block_t data_end = le64_to_cpu(m->data_begin) + len;
+			r = dm_sm_dec_blocks(data_sm, data_begin, data_end);
+			if (r)
+				return r;
 			m->len = cpu_to_le32(thin_begin - key);
+			i++;
+		}
+
+		/* Collect entries that are entirely within the remove range */
+		within_start = i;
+		for (; i < nr_entries; i++) {
+			m = n->values + i;
+			key = le64_to_cpu(n->keys[i]);
+			len = le32_to_cpu(m->len);
+
+			if (key + len > thin_end)
+				break;
+
+			/* case c */
+			{
+				pr_alert("case c, key: %llu, len: %llu, thin_begin: %llu, thin_end: %llu",
+                                         (unsigned long long) key,
+                                         (unsigned long long) len,
+                                         (unsigned long long) thin_begin,
+                                         (unsigned long long) thin_end);
+	                        dm_block_t data_begin = le64_to_cpu(m->data_begin);
+	                        dm_block_t data_end = data_begin + len;
+	                        r = dm_sm_dec_blocks(data_sm, data_begin, data_end);
+	                        if (r)
+		                        return r;
+			}
+		}
+		within_end = i;
+
+		if (within_end - within_start)
+			erase_leaf_entries(n, within_start, within_end);
+
+		if (i < nr_entries) {
+			key = le64_to_cpu(n->keys[i]);
+			len = le32_to_cpu(m->len);
+			m = n->values + i;
+			if (key < thin_end) {
+				/* case d */
+				pr_alert("case d");
+				dm_block_t data_begin = le64_to_cpu(m->data_begin);
+				r = dm_sm_dec_blocks(data_sm, data_begin, thin_end);
+				if (r)
+					return r;
+				m->data_begin = cpu_to_le64(thin_end);
+				m->len = cpu_to_le32(len - (thin_end - key));
+			}
 		}
 	}
 
@@ -1502,6 +1553,8 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 	return 0;
 }
 
+// FIXME: removing the middle of a mapping can cause an extra entry to
+// be inserted.  So we need to ensure there's enough space.
 static int remove_(struct dm_transaction_manager *tm,
                    struct dm_space_map *data_sm,
                    dm_block_t b, struct dm_block *parent, unsigned parent_index,
@@ -1533,10 +1586,11 @@ static int remove_(struct dm_transaction_manager *tm,
 		r = remove_internal_(tm, data_sm, block, thin_begin, thin_end, new_root);
 	else
 		r = remove_leaf_(tm, data_sm, block, thin_begin, thin_end);
-	dm_tm_unlock(tm, block);
 
 	if (!r && !parent)
 		*new_root = dm_block_location(block);
+	dm_tm_unlock(tm, block);
+
 	return r;
 }
 
