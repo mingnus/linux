@@ -64,6 +64,32 @@ struct leaf_node {
 	struct disk_mapping values[LEAF_NR_ENTRIES];
 } __attribute__((packed, aligned(8)));
 
+struct del_operands {
+	struct dm_transaction_manager *tm;
+	struct dm_space_map *data_sm;
+};
+
+struct insert_operands {
+	struct dm_transaction_manager *tm;
+	struct dm_space_map *data_sm;
+	struct dm_mapping *v;
+};
+
+struct remove_operands {
+	struct dm_transaction_manager *tm;
+	struct dm_space_map *data_sm;
+	dm_block_t thin_b;
+	dm_block_t thin_e;
+};
+
+struct node_ops {
+	int (*del)(struct del_operands *os, struct dm_block *b);
+	int (*insert)(struct insert_operands *os, struct dm_block *b);
+	int (*remove)(struct remove_operands *os, struct dm_block *b);
+};
+
+static int get_ops(struct node_header *h, struct node_ops **ops);
+
 /*----------------------------------------------------------------*/
 
 // FIXME: generate own random number
@@ -111,6 +137,116 @@ struct dm_block_validator validator = {
 
 /*----------------------------------------------------------------*/
 
+static int del_(struct del_operands *os, dm_block_t loc)
+{
+	int r;
+	struct node_ops *ops;
+	struct dm_block *b;
+
+	r = dm_tm_read_lock(os->tm, loc, &validator, &b);
+	if (r)
+		return r;
+
+	r = get_ops(dm_block_data(b), &ops);
+	if (r) {
+		dm_tm_unlock(os->tm, b);
+		return r;
+	}
+
+	r = ops->del(os, b);
+	dm_tm_unlock(os->tm, b);
+	return r;
+}
+
+static int internal_del(struct del_operands *os, struct dm_block *b)
+{
+	int r;
+	struct internal_node *n = dm_block_data(b);
+	struct dm_block_manager *bm = dm_tm_get_bm(os->tm);
+	uint32_t i, nr_entries = le32_to_cpu(n->header.nr_entries);
+
+	/* prefetch children */
+	for (i = 0; i < nr_entries; i++)
+		dm_bm_prefetch(bm, le64_to_cpu(n->values[i]));
+
+	/* recurse into children */
+	for (i = 0; i < nr_entries; i++) {
+		int shared;
+		dm_block_t child_b = le64_to_cpu(n->values[i]);
+
+		r = dm_tm_block_is_shared(os->tm, child_b, &shared);
+		if (r)
+			return r;
+
+		if (shared) {
+			/* just decrement the ref count for this child */
+			dm_tm_dec(os->tm, child_b);
+		} else {
+			r = del_(os, child_b);
+			if (r)
+				return r;
+		}
+	}
+
+	dm_tm_dec(os->tm, dm_block_location(b));
+	return 0;
+}
+
+int internal_insert(struct insert_operands *os, struct dm_block *b)
+{
+	return -EINVAL;
+}
+
+int internal_remove(struct remove_operands *os, struct dm_block *b)
+{
+	return -EINVAL;
+}
+
+static struct node_ops internal_ops = {
+	.del = internal_del,
+	.insert = NULL,
+	.remove = NULL
+};
+
+/*----------------------------------------------------------------*/
+
+static int leaf_del(struct del_operands *os, struct dm_block *b)
+{
+	struct leaf_node *n = dm_block_data(b);
+	uint32_t i, nr_entries = le32_to_cpu(n->header.nr_entries);
+
+	/* release the data blocks */
+	for (i = 0; i < nr_entries; i++) {
+		struct disk_mapping *m = n->values + i;
+		dm_block_t data_begin = le64_to_cpu(m->data_begin);
+		dm_block_t data_end = data_begin + le32_to_cpu(m->len);
+		dm_sm_dec_blocks(os->data_sm, data_begin, data_end);
+	}
+
+	dm_tm_dec(os->tm, dm_block_location(b));
+	return 0;
+}
+
+static struct node_ops leaf_ops = {
+	.del = leaf_del,
+	.insert = NULL,
+	.remove = NULL
+};
+
+static int get_ops(struct node_header *h, struct node_ops **ops)
+{
+	uint32_t flags = le32_to_cpu(h->flags);
+	if (flags == LEAF_NODE)
+		*ops = &leaf_ops;
+	else if (flags == INTERNAL_NODE)
+		*ops = &internal_ops;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+/*----------------------------------------------------------------*/
+
 int dm_rtree_empty(struct dm_transaction_manager *tm, dm_block_t *root)
 {
 	int r;
@@ -135,183 +271,11 @@ EXPORT_SYMBOL_GPL(dm_rtree_empty);
 
 /*----------------------------------------------------------------*/
 
-// FIXME: find a way of deleting in chunks so we don't freeze the pool.
- 
-/*
- * Deletion uses a recursive algorithm, since we have limited stack space
- * we explicitly manage our own stack on the heap.
- */
-
-#define MAX_SPINE_DEPTH 8
-struct frame {
-	struct dm_block *b;
-	unsigned nr_children;
-	unsigned current_child;
-};
-
-struct del_stack {
-	struct dm_transaction_manager *tm;
-	int top;
-	struct frame spine[MAX_SPINE_DEPTH];
-};
-
-static int top_frame(struct del_stack *s, struct frame **f)
-{
-	if (s->top < 0) {
-		DMERR("rtree deletion stack empty");
-		return -EINVAL;
-	}
-
-	*f = s->spine + s->top;
-
-	return 0;
-}
-
-static int unprocessed_frames(struct del_stack *s)
-{
-	return s->top >= 0;
-}
-
-// Assumes an internal node
-static void prefetch_children(struct del_stack *s, struct frame *f)
-{
-	unsigned i;
-	struct dm_block_manager *bm = dm_tm_get_bm(s->tm);
-	struct internal_node *n = dm_block_data(f->b);
-
-	for (i = 0; i < f->nr_children; i++)
-		dm_bm_prefetch(bm, le64_to_cpu(n->values[i]));
-}
-
-static int push_frame(struct del_stack *s, dm_block_t b)
-{
-	int r;
-	uint32_t ref_count;
-
-	if (s->top >= MAX_SPINE_DEPTH - 1) {
-		DMERR("rtree deletion stack out of memory");
-		return -ENOMEM;
-	}
-
-	r = dm_tm_ref(s->tm, b, &ref_count);
-	if (r)
-		return r;
-
-	if (ref_count > 1)
-		/*
-		 * This is a shared node, so we can just decrement the ref count
-                 * and ignore the children.
-		 */
-		dm_tm_dec(s->tm, b);
-
-	else {
-		uint32_t flags;
-		struct frame *f = s->spine + ++s->top;
-		struct node_header *h;
-
-		r = dm_tm_read_lock(s->tm, b, &validator, &f->b);
-		if (r) {
-			s->top--;
-			return r;
-		}
-
-		h = dm_block_data(f->b);
-		f->nr_children = le32_to_cpu(h->nr_entries);
-		f->current_child = 0;
-
-		flags = le32_to_cpu(h->flags);
-		if (flags & INTERNAL_NODE)
-			prefetch_children(s, f);
-	}
-
-	return 0;
-}
-
-static void pop_frame(struct del_stack *s)
-{
-	struct frame *f = s->spine + s->top--;
-
-	dm_tm_dec(s->tm, dm_block_location(f->b));
-	dm_tm_unlock(s->tm, f->b);
-}
-
-static void unlock_all_frames(struct del_stack *s)
-{
-	struct frame *f;
-
-	while (unprocessed_frames(s)) {
-		f = s->spine + s->top--;
-		dm_tm_unlock(s->tm, f->b);
-	}
-}
-
 int dm_rtree_del(struct dm_transaction_manager *tm, struct dm_space_map *data_sm, dm_block_t root)
 {
-	int r;
-	struct del_stack *s;
+	struct del_operands os = {.tm = tm, .data_sm = data_sm};
+	return del_(&os, root);
 
-	pr_alert("dm_rtree_del");
-
-	/*
-	 * This is called via an ioctl, as such should be * considered an FS op.
-         * We can't recurse back into the FS, so we * allocate GFP_NOFS.
-	 */
-	s = kmalloc(sizeof(*s), GFP_NOFS);
-	if (!s)
-		return -ENOMEM;
-	s->tm = tm;
-	s->top = -1;
-
-	r = push_frame(s, root);
-	if (r)
-		goto out;
-
-	while (unprocessed_frames(s)) {
-		struct node_header *h;
-		uint32_t flags;
-		struct frame *f;
-		dm_block_t b;
-
-		r = top_frame(s, &f);
-		if (r)
-			goto out;
-
-		if (f->current_child >= f->nr_children) {
-			pop_frame(s);
-			continue;
-		}
-
-		h = dm_block_data(f->b);
-		flags = le32_to_cpu(h->flags);
-		if (flags & INTERNAL_NODE) {
-			struct internal_node *n = (struct internal_node *) h;
-			b = le64_to_cpu(n->values[f->current_child++]);
-			r = push_frame(s, b);
-			if (r)
-				goto out;
-
-		} else {
-			unsigned i;
-			struct leaf_node *n = (struct leaf_node *) h;
-			for (i = 0; i < f->nr_children; i++) {
-				struct disk_mapping *m = n->values + i;
-				dm_block_t data_begin = le64_to_cpu(m->data_begin);
-				dm_block_t data_end = data_begin + le32_to_cpu(m->len);
-				r = dm_sm_dec_blocks(data_sm, data_begin, data_end);
-				if (r)
-					return r;
-			}
-
-			pop_frame(s);
-		}
-	}
-
-out:
-	if (r)
-		unlock_all_frames(s);
-	kfree(s);
-
-	return r;
 }
 EXPORT_SYMBOL_GPL(dm_rtree_del);
 
