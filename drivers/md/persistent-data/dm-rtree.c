@@ -64,12 +64,12 @@ struct leaf_node {
 	struct disk_mapping values[LEAF_NR_ENTRIES];
 } __attribute__((packed, aligned(8)));
 
-struct del_operands {
+struct del_args {
 	struct dm_transaction_manager *tm;
 	struct dm_space_map *data_sm;
 };
 
-struct insert_operands {
+struct insert_args {
 	struct dm_transaction_manager *tm;
 	struct dm_space_map *data_sm;
 	struct dm_mapping *v;
@@ -86,7 +86,7 @@ struct insert_result {
 	struct node_info nodes[2];
 };
 
-struct remove_operands {
+struct remove_args {
 	struct dm_transaction_manager *tm;
 	struct dm_space_map *data_sm;
 	dm_block_t thin_b;
@@ -94,9 +94,9 @@ struct remove_operands {
 };
 
 struct node_ops {
-	int (*del)(struct del_operands *os, struct dm_block *b);
-	int (*insert)(struct insert_operands *os, struct dm_block *b, struct insert_result *res);
-	int (*remove)(struct remove_operands *os, struct dm_block *b);
+	int (*del)(struct del_args *args, struct dm_block *b);
+	int (*insert)(struct insert_args *args, struct dm_block *b, struct insert_result *res);
+	int (*remove)(struct remove_args *args, struct dm_block *b);
 };
 
 static int get_ops(struct node_header *h, struct node_ops **ops);
@@ -194,32 +194,32 @@ static void array_erase(void *base, size_t elt_size, unsigned nr_elts,
 
 /*----------------------------------------------------------------*/
 
-static int del_(struct del_operands *os, dm_block_t loc)
+static int del_(struct del_args *args, dm_block_t loc)
 {
 	int r;
 	struct node_ops *ops;
 	struct dm_block *b;
 
-	r = dm_tm_read_lock(os->tm, loc, &validator, &b);
+	r = dm_tm_read_lock(args->tm, loc, &validator, &b);
 	if (r)
 		return r;
 
 	r = get_ops(dm_block_data(b), &ops);
 	if (r) {
-		dm_tm_unlock(os->tm, b);
+		dm_tm_unlock(args->tm, b);
 		return r;
 	}
 
-	r = ops->del(os, b);
-	dm_tm_unlock(os->tm, b);
+	r = ops->del(args, b);
+	dm_tm_unlock(args->tm, b);
 	return r;
 }
 
-static int internal_del(struct del_operands *os, struct dm_block *b)
+static int internal_del(struct del_args *args, struct dm_block *b)
 {
 	int r;
 	struct internal_node *n = dm_block_data(b);
-	struct dm_block_manager *bm = dm_tm_get_bm(os->tm);
+	struct dm_block_manager *bm = dm_tm_get_bm(args->tm);
 	uint32_t i, nr_entries = le32_to_cpu(n->header.nr_entries);
 
 	/* prefetch children */
@@ -231,21 +231,21 @@ static int internal_del(struct del_operands *os, struct dm_block *b)
 		int shared;
 		dm_block_t child_b = le64_to_cpu(n->values[i]);
 
-		r = dm_tm_block_is_shared(os->tm, child_b, &shared);
+		r = dm_tm_block_is_shared(args->tm, child_b, &shared);
 		if (r)
 			return r;
 
 		if (shared) {
 			/* just decrement the ref count for this child */
-			dm_tm_dec(os->tm, child_b);
+			dm_tm_dec(args->tm, child_b);
 		} else {
-			r = del_(os, child_b);
+			r = del_(args, child_b);
 			if (r)
 				return r;
 		}
 	}
 
-	dm_tm_dec(os->tm, dm_block_location(b));
+	dm_tm_dec(args->tm, dm_block_location(b));
 	return 0;
 }
 
@@ -311,13 +311,13 @@ static void redist2_internal(struct internal_node *left, struct internal_node *r
 }
 
 // FIXME: rename
-static int insert_aux(struct insert_operands *os, dm_block_t loc, struct insert_result *res)
+static int insert_aux(struct insert_args *args, dm_block_t loc, struct insert_result *res)
 {
 	int r, inc;
 	struct dm_block *b;
 	struct node_ops *ops;
 
-	r = dm_tm_shadow_block(os->tm, loc, &validator, &b, &inc);
+	r = dm_tm_shadow_block(args->tm, loc, &validator, &b, &inc);
 	if (r)
 		return r;
 
@@ -327,16 +327,16 @@ static int insert_aux(struct insert_operands *os, dm_block_t loc, struct insert_
 
 	r = get_ops(dm_block_data(b), &ops);
 	if (r) {
-		dm_tm_unlock(os->tm, b);
+		dm_tm_unlock(args->tm, b);
 		return r;
 	}
 
-	r = ops->insert(os, b, res);
-	dm_tm_unlock(os->tm, b);
+	r = ops->insert(args, b, res);
+	dm_tm_unlock(args->tm, b);
 	return r;
 }
 
-static int internal_insert(struct insert_operands *os, struct dm_block *b, struct insert_result *res)
+static int internal_insert(struct insert_args *args, struct dm_block *b, struct insert_result *res)
 {
 	int r, i;
 	dm_block_t child_b;
@@ -344,12 +344,12 @@ static int internal_insert(struct insert_operands *os, struct dm_block *b, struc
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
 	pr_alert("internal_insert");
 	
-	i = lower_bound(n->keys, nr_entries, os->v->thin_begin);
+	i = lower_bound(n->keys, nr_entries, args->v->thin_begin);
 	if (i < 0)
 		i = 0;
 
 	child_b = le64_to_cpu(n->values[i]);
-	r = insert_aux(os, child_b, res);
+	r = insert_aux(args, child_b, res);
 
 	if (res->nr_nodes == 1) {
 		// FIXME: check for under populated node
@@ -374,7 +374,7 @@ static int internal_insert(struct insert_operands *os, struct dm_block *b, struc
 		struct dm_block *sib;
 		struct internal_node *sib_n;
 
-		r = dm_tm_new_block(os->tm, &validator, &sib);
+		r = dm_tm_new_block(args->tm, &validator, &sib);
 		if (r < 0)
 			return r;
 
@@ -393,13 +393,13 @@ static int internal_insert(struct insert_operands *os, struct dm_block *b, struc
 		res->nodes[1].lowest_key = le64_to_cpu(sib_n->keys[0]);
 		res->nodes[1].nr_entries = le32_to_cpu(sib_n->header.nr_entries);
 
-		dm_tm_unlock(os->tm, sib);
+		dm_tm_unlock(args->tm, sib);
 	}
 
 	return 0;
 }
 
-static int internal_remove(struct remove_operands *os, struct dm_block *b)
+static int internal_remove(struct remove_args *args, struct dm_block *b)
 {
 	return -EINVAL;
 }
@@ -412,7 +412,7 @@ static struct node_ops internal_ops = {
 
 /*----------------------------------------------------------------*/
 
-static int leaf_del(struct del_operands *os, struct dm_block *b)
+static int leaf_del(struct del_args *args, struct dm_block *b)
 {
 	struct leaf_node *n = dm_block_data(b);
 	uint32_t i, nr_entries = le32_to_cpu(n->header.nr_entries);
@@ -422,10 +422,10 @@ static int leaf_del(struct del_operands *os, struct dm_block *b)
 		struct disk_mapping *m = n->values + i;
 		dm_block_t data_begin = le64_to_cpu(m->data_begin);
 		dm_block_t data_end = data_begin + le32_to_cpu(m->len);
-		dm_sm_dec_blocks(os->data_sm, data_begin, data_end);
+		dm_sm_dec_blocks(args->data_sm, data_begin, data_end);
 	}
 
-	dm_tm_dec(os->tm, dm_block_location(b));
+	dm_tm_dec(args->tm, dm_block_location(b));
 	return 0;
 }
 
@@ -445,7 +445,8 @@ static void move_entries_leaf(struct leaf_node *dest, unsigned dest_offset,
 	memmove(dest->values + dest_offset, src->values + src_offset, count * sizeof(dest->values[0]));
 }
 
-
+// FIXME: make copy/move_entries generic, then we need only one redist2
+// fn.
 static void redist2_leaf(struct leaf_node *left, struct leaf_node *right)
 {
 	unsigned nr_left = le32_to_cpu(left->header.nr_entries);
@@ -470,7 +471,7 @@ static void redist2_leaf(struct leaf_node *left, struct leaf_node *right)
 	right->header.nr_entries = cpu_to_le32(target_right);
 }
 
-static int insert_into_leaf(struct insert_operands *os, struct dm_block *b, unsigned index,
+static int insert_into_leaf(struct insert_args *args, struct dm_block *b, unsigned index,
 		      	    struct insert_result *res)
 {
 	int r;
@@ -483,7 +484,7 @@ static int insert_into_leaf(struct insert_operands *os, struct dm_block *b, unsi
 		struct dm_block *sib;
 		struct leaf_node *sib_n, *n2;
 
-		r = dm_tm_new_block(os->tm, &validator, &sib);
+		r = dm_tm_new_block(args->tm, &validator, &sib);
 		if (r < 0)
 			return r;
 
@@ -496,7 +497,7 @@ static int insert_into_leaf(struct insert_operands *os, struct dm_block *b, unsi
 
 		pr_alert("index = %u, nr_entries = %u", index, (unsigned) nr_entries);
 		/* choose which sibling to insert into */
-		if (os->v->thin_begin < sib_n->keys[0])
+		if (args->v->thin_begin < sib_n->keys[0])
 			n2 = n;
 
 		else {
@@ -508,7 +509,7 @@ static int insert_into_leaf(struct insert_operands *os, struct dm_block *b, unsi
 
 		// FIXME: factor out
 		{
-			struct dm_mapping *v = os->v;
+			struct dm_mapping *v = args->v;
 			__le64 key_le = cpu_to_le64(v->thin_begin);
 			struct disk_mapping value_le;
 
@@ -531,14 +532,14 @@ static int insert_into_leaf(struct insert_operands *os, struct dm_block *b, unsi
 		res->nodes[1].lowest_key = le64_to_cpu(sib_n->keys[0]);
 		res->nodes[1].nr_entries = le32_to_cpu(sib_n->header.nr_entries);
 
-		dm_tm_unlock(os->tm, sib);
+		dm_tm_unlock(args->tm, sib);
 	} else {
 		// FIXME: factor out
-		__le64 key_le = cpu_to_le64(os->v->thin_begin);
+		__le64 key_le = cpu_to_le64(args->v->thin_begin);
 
-		value_le.data_begin = cpu_to_le64(os->v->data_begin);
-		value_le.len = cpu_to_le32(os->v->len);
-		value_le.time = cpu_to_le32(os->v->time);
+		value_le.data_begin = cpu_to_le64(args->v->data_begin);
+		value_le.len = cpu_to_le32(args->v->len);
+		value_le.time = cpu_to_le32(args->v->time);
 
 		array_insert(n->keys, sizeof(n->keys[0]), nr_entries, index, &key_le);
 		array_insert(n->values, sizeof(n->values[0]), nr_entries, index, &value_le);
@@ -568,20 +569,20 @@ static void erase_from_leaf(struct leaf_node *node, unsigned index)
 	node->header.nr_entries = cpu_to_le32(nr_entries - 1);
 }
 
-static int leaf_insert(struct insert_operands *os, struct dm_block *b, struct insert_result *res)
+static int leaf_insert(struct insert_args *args, struct dm_block *b, struct insert_result *res)
 {
 	int i;
 	struct leaf_node *n = dm_block_data(b);
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
-	struct dm_mapping *value = os->v;
+	struct dm_mapping *value = args->v;
 
 	pr_alert("leaf_insert");
 	// FIXME: would this be better named 'index'
-	i = lower_bound(n->keys, nr_entries, os->v->thin_begin);
+	i = lower_bound(n->keys, nr_entries, args->v->thin_begin);
 
 	if (nr_entries == 0) {
 		pr_alert("a");
-		insert_into_leaf(os, b, 0, res);
+		insert_into_leaf(args, b, 0, res);
 
 	} else if (i < 0) {
 		pr_alert("b");
@@ -593,7 +594,7 @@ static int leaf_insert(struct insert_operands *os, struct dm_block *b, struct in
 		right.len = le32_to_cpu(m->len);
 		right.time = le32_to_cpu(m->time);
 		
-		if (adjacent_mapping(os->v, &right)) {
+		if (adjacent_mapping(args->v, &right)) {
 		pr_alert("c");
 			n->keys[0] = cpu_to_le64(value->thin_begin);
 			m->data_begin = cpu_to_le64(value->data_begin);
@@ -601,7 +602,7 @@ static int leaf_insert(struct insert_operands *os, struct dm_block *b, struct in
 		} else {
 		pr_alert("d");
 			/* new entry goes at start */
-			insert_into_leaf(os, b, 0, res);
+			insert_into_leaf(args, b, 0, res);
 		}
 
 	} else if (i == nr_entries - 1) {
@@ -617,10 +618,10 @@ static int leaf_insert(struct insert_operands *os, struct dm_block *b, struct in
 
 		if (adjacent_mapping(&left, value)) {
 		pr_alert("f");
-			m->len = cpu_to_le32(left.len + os->v->len);
+			m->len = cpu_to_le32(left.len + args->v->len);
 		} else {
 		pr_alert("g");
-			return insert_into_leaf(os, b, i + 1, res);
+			return insert_into_leaf(args, b, i + 1, res);
 		}
 
 	} else {
@@ -645,23 +646,23 @@ static int leaf_insert(struct insert_operands *os, struct dm_block *b, struct in
 			if (adjacent_mapping(value, &right)) {
 		pr_alert("j");
 				/* adjacent to both left and right */
-				lm->len = cpu_to_le32(left.len + os->v->len + right.len);
+				lm->len = cpu_to_le32(left.len + args->v->len + right.len);
 				erase_from_leaf(n, i + 1);
 			} else {
 		pr_alert("k");
 				/* adjacent to left only */
-				lm->len = cpu_to_le32(left.len + os->v->len);
+				lm->len = cpu_to_le32(left.len + args->v->len);
 			}
 		} else if (adjacent_mapping(value, &right)) {
 		pr_alert("l");
 			/* adjacent to right only */
-			n->keys[i + 1] = cpu_to_le64(os->v->thin_begin);
-			rm->data_begin = cpu_to_le64(os->v->data_begin);
+			n->keys[i + 1] = cpu_to_le64(args->v->thin_begin);
+			rm->data_begin = cpu_to_le64(args->v->data_begin);
 			rm->len = cpu_to_le32(value->len + right.len);
 		} else {
 		pr_alert("m");
 			/* not adjacent */
-			return insert_into_leaf(os, b, i + 1, res);
+			return insert_into_leaf(args, b, i + 1, res);
 		}
 	}
 
@@ -720,8 +721,8 @@ EXPORT_SYMBOL_GPL(dm_rtree_empty);
 
 int dm_rtree_del(struct dm_transaction_manager *tm, struct dm_space_map *data_sm, dm_block_t root)
 {
-	struct del_operands os = {.tm = tm, .data_sm = data_sm};
-	return del_(&os, root);
+	struct del_args args = {.tm = tm, .data_sm = data_sm};
+	return del_(&args, root);
 
 }
 EXPORT_SYMBOL_GPL(dm_rtree_del);
@@ -1532,9 +1533,9 @@ int dm_rtree_insert(struct dm_transaction_manager *tm,
                     struct dm_mapping *value, dm_block_t *new_root, unsigned *nr_inserts)
 {
 	int r;
-	struct insert_operands os = {.tm = tm, .data_sm = data_sm, .v = value};
+	struct insert_args args = {.tm = tm, .data_sm = data_sm, .v = value};
 	struct insert_result res;
-	r = insert_aux(&os, root, &res);
+	r = insert_aux(&args, root, &res);
 	if (r)
 		return r;
 
