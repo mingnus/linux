@@ -1724,7 +1724,7 @@ EXPORT_SYMBOL_GPL(dm_rtree_insert);
 
 /*----------------------------------------------------------------*/
 
-#if 0
+//#if 0
 static int remove_(struct dm_transaction_manager *tm,
                    struct dm_space_map *data_sm,
                    dm_block_t b, struct dm_block *parent, unsigned parent_index,
@@ -1864,17 +1864,20 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 
 	if (key < thin_begin && (key + len) > thin_end) {
 		/* case e */
-		struct dm_mapping back_half;
-		back_half.thin_begin = thin_end;
-		back_half.data_begin = le64_to_cpu(m->data_begin) + (thin_end - thin_begin);
-		back_half.len = len - (thin_end - thin_begin);
-		back_half.time = m->time;
+		struct dm_mapping back_half = {
+			.thin_begin = thin_end,
+			.data_begin = le64_to_cpu(m->data_begin) + (thin_end - thin_begin),
+			.len = len - (thin_end - thin_begin),
+			.time = m->time,
+		};
+		struct insert_args args = {.tm = tm, .data_sm = data_sm, .v = &back_half};
+		struct insert_result res;
 
 		/* truncate the front half */
 		m->len = cpu_to_le32(thin_begin - key);
 
 		/* insert new back half entry */
-		insert_into_leaf(n, i + 1, &back_half);
+		insert_into_leaf(&args, block, i + 1, &res);
 	} else {
 		if (key + len <= thin_begin) {
 			/* case a */
@@ -1921,8 +1924,10 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 			m = n->values + i;
 			if (key < thin_end) {
 				/* case d */
+				dm_block_t data_begin;
+
 				pr_alert("case d");
-				dm_block_t data_begin = le64_to_cpu(m->data_begin);
+				data_begin = le64_to_cpu(m->data_begin);
 				r = dm_sm_dec_blocks(data_sm, data_begin, thin_end);
 				if (r)
 					return r;
@@ -1965,7 +1970,7 @@ static int remove_(struct dm_transaction_manager *tm,
 		return r;
 
 	if (inc)
-		inc_children(tm, data_sm, block);
+		; // inc_children(tm, data_sm, block); // FIXME: finish
 
 	/* patch up parent */
 	if (parent) {
@@ -1987,7 +1992,7 @@ static int remove_(struct dm_transaction_manager *tm,
 
 	return r;
 }
-#endif
+//#endif
 
 // FIXME: we need to know how many mappings were removed.
 int dm_rtree_remove(struct dm_transaction_manager *tm,
@@ -1996,7 +2001,7 @@ int dm_rtree_remove(struct dm_transaction_manager *tm,
                     dm_block_t thin_begin, dm_block_t thin_end,
                     dm_block_t *new_root)
 {
-	return -EINVAL;
+	return remove_(tm, data_sm, b, NULL, 0, thin_begin, thin_end, new_root);
 }
 EXPORT_SYMBOL_GPL(dm_rtree_remove);
 
