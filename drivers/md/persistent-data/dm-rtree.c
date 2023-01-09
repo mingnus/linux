@@ -390,6 +390,30 @@ static void redist2_internal(struct dm_block *left_, struct dm_block *right_)
 	}
 }
 
+static int inc_children(struct dm_transaction_manager *tm, struct dm_space_map *data_sm, struct dm_block *b) {
+	struct node_header *h = dm_block_data(b);
+	uint32_t flags = le32_to_cpu(h->flags);
+	uint32_t nr_entries = le32_to_cpu(h->nr_entries);
+
+	if (flags == INTERNAL_NODE) {
+		struct internal_node *n = (struct internal_node*)h;
+		dm_tm_with_runs(tm, n->values, nr_entries, dm_tm_inc_range);
+	} else if (flags == LEAF_NODE) {
+		struct leaf_node *n = (struct leaf_node*)h;
+		int i;
+		for (i = 0; i < nr_entries; i++) {
+			struct disk_mapping *m = n->values + i;
+			dm_block_t data_begin = le64_to_cpu(m->data_begin);
+			dm_block_t data_end = data_begin + le32_to_cpu(m->len);
+			dm_sm_inc_blocks(data_sm, data_begin, data_end);
+		}
+	} else {
+	    return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int shadow_node(struct dm_transaction_manager *tm, struct dm_space_map *data_sm,
                        dm_block_t loc, struct dm_block **result)
 {
@@ -399,9 +423,8 @@ static int shadow_node(struct dm_transaction_manager *tm, struct dm_space_map *d
 	if (r)
 		return r;
 
-	if (inc) {
-		// FIXME: finish
-	}
+	if (inc)
+		inc_children(tm, data_sm, *result);
 
 	return 0;
 }
@@ -1773,6 +1796,7 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 
 		if (i == (nr_entries - 1)) {
 			// FIXME: node_end is error prone, so I'm going to just recurse for now.
+			// FIXME: Do not recurse if key >= thin_end ?
 			remove_(tm, data_sm, le64_to_cpu(n->values[i]),
                                 block, i, thin_begin, thin_end, new_root);
 
@@ -1952,6 +1976,7 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 	return 0;
 }
 
+
 // FIXME: removing the middle of a mapping can cause an extra entry to
 // be inserted.  So we need to ensure there's enough space.
 static int remove_(struct dm_transaction_manager *tm,
@@ -1970,7 +1995,7 @@ static int remove_(struct dm_transaction_manager *tm,
 		return r;
 
 	if (inc)
-		; // inc_children(tm, data_sm, block); // FIXME: finish
+		inc_children(tm, data_sm, block);
 
 	/* patch up parent */
 	if (parent) {
