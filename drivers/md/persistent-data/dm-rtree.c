@@ -1763,9 +1763,10 @@ static void erase_internal_entry(struct internal_node *n, unsigned index)
 
 static void erase_leaf_entries(struct leaf_node *n, unsigned index_b, unsigned index_e)
 {
-	n->header.nr_entries = cpu_to_le32(le32_to_cpu(n->header.nr_entries) - (index_e - index_b));
-	memmove(n->keys + index_b, n->keys + index_e, sizeof(n->keys[0]));
-	memmove(n->values + index_b, n->values + index_e, sizeof(n->values[0]));
+	size_t upper = le32_to_cpu(n->header.nr_entries) - index_e;
+	n->header.nr_entries = cpu_to_le32(index_b + upper);
+	memmove(n->keys + index_b, n->keys + index_e, sizeof(n->keys[0]) * upper);
+	memmove(n->values + index_b, n->values + index_e, sizeof(n->values[0]) * upper);
 }
 
 /*
@@ -1888,10 +1889,11 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 
 	if (key < thin_begin && (key + len) > thin_end) {
 		/* case e */
+		dm_block_t delta = thin_end - key;
 		struct dm_mapping back_half = {
 			.thin_begin = thin_end,
-			.data_begin = le64_to_cpu(m->data_begin) + (thin_end - thin_begin),
-			.len = len - (thin_end - thin_begin),
+			.data_begin = le64_to_cpu(m->data_begin) + delta,
+			.len = len - delta,
 			.time = m->time,
 		};
 		struct insert_args args = {.tm = tm, .data_sm = data_sm, .v = &back_half};
@@ -1909,7 +1911,7 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 		} else if ((key < thin_begin)) {
 			/* case b */
 			dm_block_t delta = thin_begin - key;
-			dm_block_t data_begin = le64_to_cpu(m->data_begin + delta);
+			dm_block_t data_begin = le64_to_cpu(m->data_begin) + delta;
 			dm_block_t data_end = le64_to_cpu(m->data_begin) + len;
 			r = dm_sm_dec_blocks(data_sm, data_begin, data_end);
 			if (r)
@@ -1939,24 +1941,33 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 		}
 		within_end = i;
 
-		if (within_end - within_start)
+		if (within_end > within_start) {
+			unsigned shift = within_end - within_start;
 			erase_leaf_entries(n, within_start, within_end);
+			nr_entries -= shift;
+			i -= shift;
+		}
 
 		if (i < nr_entries) {
 			key = le64_to_cpu(n->keys[i]);
-			len = le32_to_cpu(m->len);
 			m = n->values + i;
+			len = le32_to_cpu(m->len);
+
 			if (key < thin_end) {
 				/* case d */
 				dm_block_t data_begin;
+				dm_block_t delta;
 
 				pr_alert("case d");
 				data_begin = le64_to_cpu(m->data_begin);
-				r = dm_sm_dec_blocks(data_sm, data_begin, thin_end);
+				delta = thin_end - key;
+				r = dm_sm_dec_blocks(data_sm, data_begin, data_begin + delta);
 				if (r)
 					return r;
-				m->data_begin = cpu_to_le64(thin_end);
-				m->len = cpu_to_le32(len - (thin_end - key));
+				m->data_begin += delta;
+				m->len = cpu_to_le32(len - delta);
+
+				n->keys[i] = thin_end;
 			}
 		}
 	}
