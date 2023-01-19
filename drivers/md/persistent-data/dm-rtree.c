@@ -1756,9 +1756,11 @@ static int remove_(struct dm_transaction_manager *tm,
 
 static void erase_internal_entry(struct internal_node *n, unsigned index)
 {
-	n->header.nr_entries = cpu_to_le32(le32_to_cpu(n->header.nr_entries) - 1);
-	memmove(n->keys + index, n->keys + index + 1, sizeof(n->keys[0]));
-	memmove(n->values + index, n->values + index + 1, sizeof(n->values[0]));
+	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
+	size_t upper = nr_entries - index - 1;
+	n->header.nr_entries = cpu_to_le32(nr_entries - 1);
+	memmove(n->keys + index, n->keys + index + 1, sizeof(n->keys[0]) * upper);
+	memmove(n->values + index, n->values + index + 1, sizeof(n->values[0]) * upper);
 }
 
 static void erase_leaf_entries(struct leaf_node *n, unsigned index_b, unsigned index_e)
@@ -1818,8 +1820,9 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 	                        // FIXME: repeated moves
 	  			child = le64_to_cpu(n->values[i]); 
 	                        erase_internal_entry(n, i);
+				i -= 1;
+				nr_entries -= 1;
 	                        {
-		                        dm_tm_unlock(tm, block);
 		                        r = dm_rtree_del(tm, data_sm, child); 
 		                        if (r)
 			                        return r;
