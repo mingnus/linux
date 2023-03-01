@@ -6,6 +6,7 @@
 
 #include "dm-thin-metadata.h"
 #include "persistent-data/dm-btree.h"
+#include "persistent-data/dm-rtree.h"
 #include "persistent-data/dm-space-map.h"
 #include "persistent-data/dm-space-map-disk.h"
 #include "persistent-data/dm-transaction-manager.h"
@@ -1086,7 +1087,7 @@ static int __create_thin(struct dm_pool_metadata *pmd,
 	/*
 	 * Create an empty btree for the mappings.
 	 */
-	r = dm_btree_empty(&pmd->bl_info, &dev_root);
+	r = dm_rtree_empty(pmd->tm, &dev_root);
 	if (r)
 		return r;
 
@@ -1097,14 +1098,14 @@ static int __create_thin(struct dm_pool_metadata *pmd,
 	__dm_bless_for_disk(&value);
 	r = dm_btree_insert(&pmd->tl_info, pmd->root, &key, &value, &pmd->root);
 	if (r) {
-		dm_btree_del(&pmd->bl_info, dev_root);
+		dm_rtree_del(pmd->tm, pmd->data_sm, dev_root);
 		return r;
 	}
 
 	r = __open_device(pmd, dev, 1, &td);
 	if (r) {
 		dm_btree_remove(&pmd->tl_info, pmd->root, &key, &pmd->root);
-		dm_btree_del(&pmd->bl_info, dev_root);
+		dm_rtree_del(pmd->tm, pmd->data_sm, dev_root);
 		return r;
 	}
 	__close_device(td);
@@ -1636,19 +1637,33 @@ static int __insert(struct dm_thin_device *td, dm_block_t block,
 	int r, inserted;
 	__le64 value;
 	struct dm_pool_metadata *pmd = td->pmd;
-	dm_block_t keys[2] = { td->id, block };
+	struct dm_mapping mapping;
+	dm_block_t mapping_root;
+	dm_block_t new_root;
+	unsigned nr_inserts;
 
-	value = cpu_to_le64(pack_block_time(data_block, pmd->time));
-	__dm_bless_for_disk(&value);
+	/* Find the mapping tree */
+	dm_block_t keys[1] = { td->id };
+	r = dm_btree_lookup(&pmd->tl_info, pmd->root, keys, &value);
+	if (r)
+		return r;
 
-	r = dm_btree_insert_notify(&pmd->info, pmd->root, keys, &value,
-				   &pmd->root, &inserted);
+	/* Insert into the range-tree */
+	mapping_root = le64_to_cpu(value);
+	mapping.thin_begin = block;
+	mapping.data_begin = data_block;
+	mapping.len = 1;
+	mapping.time = pmd->time;
+	nr_inserts = 0;
+	r = dm_rtree_insert(pmd->tm, pmd->data_sm, mapping_root, &mapping, &new_root, &nr_inserts);
 	if (r)
 		return r;
 
 	td->changed = true;
-	if (inserted)
+
+	if (nr_inserts == 1) {
 		td->mapped_blocks++;
+	}
 
 	return 0;
 }
@@ -1712,25 +1727,12 @@ static int __remove_range(struct dm_thin_device *td, dm_block_t begin, dm_block_
 	 * Remove leaves stops at the first unmapped entry, so we have to
 	 * loop round finding mapped ranges.
 	 */
-	while (begin < end) {
-		r = dm_btree_lookup_next(&pmd->bl_info, mapping_root, &begin, &begin, &value);
-		if (r == -ENODATA)
-			break;
+	r = dm_rtree_remove(pmd->tm, pmd->data_sm, mapping_root, begin, end, &mapping_root);
+	if (r)
+		return r;
 
-		if (r)
-			return r;
-
-		if (begin >= end)
-			break;
-
-		r = dm_btree_remove_leaves(&pmd->bl_info, mapping_root, &begin, end, &mapping_root, &count);
-		if (r)
-			return r;
-
-		total_count += count;
-	}
-
-	td->mapped_blocks -= total_count;
+	// FIXME: return the number of removed keys from rtree_remove
+	td->mapped_blocks -= (end - begin);
 	td->changed = true;
 
 	/*
@@ -1978,9 +1980,12 @@ int dm_thin_get_mapped_count(struct dm_thin_device *td, dm_block_t *result)
 	return r;
 }
 
+// FIXME: finish
 static int __highest_block(struct dm_thin_device *td, dm_block_t *result)
 {
-	int r;
+	*result = 0;
+	return 0;
+	/*int r;
 	__le64 value_le;
 	dm_block_t thin_root;
 	struct dm_pool_metadata *pmd = td->pmd;
@@ -1991,7 +1996,7 @@ static int __highest_block(struct dm_thin_device *td, dm_block_t *result)
 
 	thin_root = le64_to_cpu(value_le);
 
-	return dm_btree_find_highest_key(&pmd->bl_info, thin_root, result);
+	return dm_btree_find_highest_key(&pmd->bl_info, thin_root, result);*/
 }
 
 int dm_thin_get_highest_mapped_block(struct dm_thin_device *td,
