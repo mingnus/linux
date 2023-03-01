@@ -85,6 +85,7 @@ struct node_info {
 struct insert_result {
 	unsigned nr_nodes;
 	struct node_info nodes[2];
+	unsigned flags;
 };
 
 struct remove_args {
@@ -549,12 +550,18 @@ static int internal_insert(struct insert_args *args, struct dm_block *b, struct 
 	r = insert_aux(args, child_b, res);
 
 	if (res->nr_nodes == 1) {
+		unsigned nr_entries = res->nodes[0].nr_entries;
+
 		n->keys[i] = cpu_to_le64(res->nodes[0].lowest_key);
 		n->values[i] = cpu_to_le64(res->nodes[0].loc);
 
 		// FIXME: this should depend on whether it's a leaf or internal
-		if (res->nodes[0].nr_entries < ((INTERNAL_NR_ENTRIES * 2) / 3))
+		if (res->flags == INTERNAL_NODE) {
+			if (nr_entries == INTERNAL_NR_ENTRIES || nr_entries < 80)
+				rebalance(args, n, i);
+		} else if (nr_entries == LEAF_NR_ENTRIES || nr_entries < 80) {
 			rebalance(args, n, i);
+		}
 
 		res->nr_nodes = 1;
 		init_node_info(&res->nodes[0], dm_block_location(b),
@@ -602,6 +609,8 @@ static int internal_insert(struct insert_args *args, struct dm_block *b, struct 
 			dm_tm_unlock(args->tm, sib);
 		}
 	}
+
+	res->flags = INTERNAL_NODE;
 
 	return 0;
 }
@@ -865,6 +874,9 @@ static int insert_into_leaf(struct insert_args *args, struct dm_block *b, unsign
 		init_node_info(&res->nodes[0], dm_block_location(b),
                                le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
 	}
+
+	res->flags = LEAF_NODE;
+
 	return 0;
 }
 
