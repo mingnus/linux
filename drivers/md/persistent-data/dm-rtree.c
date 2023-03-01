@@ -10,6 +10,7 @@
 #include <linux/device-mapper.h>
 
 #define DM_MSG_PREFIX "btree"
+#define SKIP_DATA_SM 1
 
 /*----------------------------------------------------------------*/
 
@@ -761,6 +762,7 @@ static void leaf_rebalance2(struct dm_transaction_manager *tm,
 
 static int leaf_del(struct del_args *args, struct dm_block *b)
 {
+#ifndef SKIP_DATA_SM
 	struct leaf_node *n = dm_block_data(b);
 	uint32_t i, nr_entries = le32_to_cpu(n->header.nr_entries);
 
@@ -771,6 +773,7 @@ static int leaf_del(struct del_args *args, struct dm_block *b)
 		dm_block_t data_end = data_begin + le32_to_cpu(m->len);
 		dm_sm_dec_blocks(args->data_sm, data_begin, data_end);
 	}
+#endif
 
 	dm_tm_dec(args->tm, dm_block_location(b));
 	return 0;
