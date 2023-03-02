@@ -1639,25 +1639,31 @@ static int __insert(struct dm_thin_device *td, dm_block_t block,
 	struct dm_pool_metadata *pmd = td->pmd;
 	struct dm_mapping mapping;
 	dm_block_t mapping_root;
-	dm_block_t new_root;
 	unsigned nr_inserts;
 
+//printk(KERN_DEBUG "step1");
 	/* Find the mapping tree */
 	dm_block_t keys[1] = { td->id };
 	r = dm_btree_lookup(&pmd->tl_info, pmd->root, keys, &value);
 	if (r)
 		return r;
 
-	/* Insert into the range-tree */
+	/* Keep the subtree so it doesn't get deleted by shadowing */
 	mapping_root = le64_to_cpu(value);
+	//dm_tm_inc(pmd->tm, mapping_root);
+
+	/* Insert into the range-tree */
 	mapping.thin_begin = block;
 	mapping.data_begin = data_block;
 	mapping.len = 1;
 	mapping.time = pmd->time;
-	nr_inserts = 0;
-	r = dm_rtree_insert(pmd->tm, pmd->data_sm, mapping_root, &mapping, &new_root, &nr_inserts);
-	if (r)
+	nr_inserts = 0; // TODO: stub
+//printk(KERN_DEBUG "step2 root=%llu", mapping_root);
+	r = dm_rtree_insert(pmd->tm, pmd->data_sm, mapping_root, &mapping, &mapping_root, &nr_inserts);
+	if (r) {
+		dm_tm_dec(pmd->tm, mapping_root);
 		return r;
+	}
 
 	td->changed = true;
 
@@ -1665,7 +1671,11 @@ static int __insert(struct dm_thin_device *td, dm_block_t block,
 		td->mapped_blocks++;
 	}
 
-	return 0;
+//printk(KERN_DEBUG "step3");
+	/* Reinsert the mapping tree */
+	value = cpu_to_le64(mapping_root);
+	__dm_bless_for_disk(&value);
+	return dm_btree_insert(&pmd->tl_info, pmd->root, keys, &value, &pmd->root);
 }
 
 int dm_thin_insert_block(struct dm_thin_device *td, dm_block_t block,
@@ -1728,8 +1738,10 @@ static int __remove_range(struct dm_thin_device *td, dm_block_t begin, dm_block_
 	 * loop round finding mapped ranges.
 	 */
 	r = dm_rtree_remove(pmd->tm, pmd->data_sm, mapping_root, begin, end, &mapping_root);
-	if (r)
+	if (r) {
+		dm_tm_dec(pmd->tm, mapping_root);
 		return r;
+	}
 
 	// FIXME: return the number of removed keys from rtree_remove
 	td->mapped_blocks -= (end - begin);
