@@ -6,6 +6,7 @@
 
 #include "dm-thin-metadata.h"
 #include "persistent-data/dm-btree.h"
+#include "persistent-data/dm-btree-internal.h"
 #include "persistent-data/dm-rtree.h"
 #include "persistent-data/dm-space-map.h"
 #include "persistent-data/dm-space-map-disk.h"
@@ -1635,47 +1636,58 @@ static int __insert(struct dm_thin_device *td, dm_block_t block,
 		    dm_block_t data_block)
 {
 	int r, inserted;
-	__le64 value;
+	__le64 *v_ptr;
 	struct dm_pool_metadata *pmd = td->pmd;
 	struct dm_mapping mapping;
+	dm_block_t tl_root;
 	dm_block_t mapping_root;
-	unsigned nr_inserts;
+	struct dm_block *tl_leaf;
+	struct btree_node *node;
+	int index;
 
-//printk(KERN_DEBUG "step1");
 	/* Find the mapping tree */
-	dm_block_t keys[1] = { td->id };
-	r = dm_btree_lookup(&pmd->tl_info, pmd->root, keys, &value);
+	r = btree_get_overwrite_leaf(&pmd->tl_info, pmd->root, td->id, &index, &tl_root, &tl_leaf);
 	if (r)
 		return r;
 
-	/* Keep the subtree so it doesn't get deleted by shadowing */
-	mapping_root = le64_to_cpu(value);
-	//dm_tm_inc(pmd->tm, mapping_root);
+	node = dm_block_data(tl_leaf);
+
+	// unlikely
+	if (index < 0 || index >= le32_to_cpu(node->header.nr_entries)) {
+	    dm_tm_unlock(pmd->tm, tl_leaf);
+	    return -EINVAL;
+	}
+
+	v_ptr = value_ptr(node, index);
+	__dm_reads_from_disk(v_ptr);
+	mapping_root = le64_to_cpu(*v_ptr);
 
 	/* Insert into the range-tree */
 	mapping.thin_begin = block;
 	mapping.data_begin = data_block;
 	mapping.len = 1;
 	mapping.time = pmd->time;
-	nr_inserts = 0; // TODO: stub
-//printk(KERN_DEBUG "step2 root=%llu", mapping_root);
-	r = dm_rtree_insert(pmd->tm, pmd->data_sm, mapping_root, &mapping, &mapping_root, &nr_inserts);
+	inserted = 0; // TODO: stub
+	r = dm_rtree_insert(pmd->tm, pmd->data_sm, mapping_root, &mapping, &mapping_root, &inserted);
 	if (r) {
-		dm_tm_dec(pmd->tm, mapping_root);
+		dm_tm_unlock(pmd->tm, tl_leaf);
 		return r;
 	}
 
 	td->changed = true;
 
-	if (nr_inserts == 1) {
+	if (inserted == 1) {
 		td->mapped_blocks++;
 	}
 
-//printk(KERN_DEBUG "step3");
 	/* Reinsert the mapping tree */
-	value = cpu_to_le64(mapping_root);
-	__dm_bless_for_disk(&value);
-	return dm_btree_insert(&pmd->tl_info, pmd->root, keys, &value, &pmd->root);
+	*v_ptr = cpu_to_le64(mapping_root);
+	__dm_written_to_disk(v_ptr);
+	dm_tm_unlock(pmd->tm, tl_leaf);
+
+	pmd->root = tl_root;
+
+	return 0;
 }
 
 int dm_thin_insert_block(struct dm_thin_device *td, dm_block_t block,
