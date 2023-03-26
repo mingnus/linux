@@ -117,6 +117,7 @@ struct node_ops {
 };
 
 static int get_ops(struct node_header *h, struct node_ops **ops);
+static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b, unsigned *space);
 
 /*----------------------------------------------------------------*/
 
@@ -510,9 +511,12 @@ out:
 	return r;
 }
 
-static void rebalance(struct insert_args *args, struct internal_node *n, unsigned index)
+
+static int rebalance(struct insert_args *args, struct internal_node *n, unsigned index)
 {
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
+	unsigned free_space;
+	int r;
 
 	BUG_ON(nr_entries < 2);
 
@@ -526,12 +530,27 @@ static void rebalance(struct insert_args *args, struct internal_node *n, unsigne
 	else
 		rebalance3(args, n, index - 1);
 #else
-	// FIXME: add rebalance 3
-	if (index == nr_entries - 1)
-		rebalance2(args, n, nr_entries - 2);
-	else
-		rebalance2(args, n, index);
+	if (index > 0) {
+		r = get_node_free_space(args->tm, n->values[index - 1], &free_space);
+		if (r)
+			return r;
 
+		if (free_space > 8) {
+			rebalance2(args, n, index - 1);
+			return 0;
+		}
+	}
+
+	if (index < nr_entries - 1) {
+		r = get_node_free_space(args->tm, n->values[index + 1], &free_space);
+		if (r)
+			return r;
+
+		if (free_space > 8)
+			rebalance2(args, n, index);
+	}
+
+	return 0;
 #endif
 }
 
@@ -1124,6 +1143,7 @@ static int shadow_child(struct dm_transaction_manager *tm,
 	pn->values[index] = cpu_to_le64(dm_block_location(*result));
 	return 0;
 }
+#endif
 
 /*
  * Returns the number of spare entries in a node.
@@ -1149,7 +1169,6 @@ static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b, 
 	dm_tm_unlock(tm, block);
 	return 0;
 }
-#endif
 
 int dm_rtree_insert(struct dm_transaction_manager *tm,
                     struct dm_space_map *data_sm,
