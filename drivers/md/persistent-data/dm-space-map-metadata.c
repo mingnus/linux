@@ -441,6 +441,11 @@ static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 		in(smm);
 		r = sm_ll_dec(&smm->ll, b, e, USE_FORGET, &nr_allocations);
 		r2 = out(smm);
+
+		if (r) {
+		    //dump_stack();
+		    printk(KERN_DEBUG "meta sm dec block failed %llu %llu", b, e);
+		}
 	}
 
 	return combine_errors(r, r2);
