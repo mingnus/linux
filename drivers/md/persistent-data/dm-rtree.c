@@ -86,6 +86,10 @@ struct insert_result {
 	unsigned nr_nodes;
 	struct node_info nodes[2];
 	unsigned flags;
+
+	// counters
+	unsigned action[8];
+	unsigned stats[8];
 };
 
 struct remove_args {
@@ -103,6 +107,23 @@ struct remove_result {
 struct rebalance_result {
 	unsigned nr_nodes;
 	struct node_info nodes[3];
+};
+
+enum insert_action {
+	LEAF_SPLIT = 1,
+	LEAF_OVERFLOW,
+	LEAF_UNDERFLOW,
+	INTERNAL_SPLIT,
+	INTERNAL_OVERFLOW,
+	INTERNAL_UNDERFLOW,
+};
+
+enum rebalance_res {
+	NOTHING = 1,
+	REDIST2,
+	REDIST3,
+	MERGED_INTO_ONE,
+	MERGED_INTO_TWO,
 };
 
 struct node_ops {
@@ -572,7 +593,7 @@ static int insert_aux(struct insert_args *args, dm_block_t loc, struct insert_re
 	return r;
 }
 
-static int rebalance3(struct insert_args *args, struct internal_node *n, unsigned index)
+static int rebalance3(struct insert_args *args, struct internal_node *n, unsigned index, int *result)
 {
 	int r;
 	struct rebalance_result res;
@@ -610,6 +631,8 @@ static int rebalance3(struct insert_args *args, struct internal_node *n, unsigne
 
 		n->keys[index + 1] = res.nodes[1].lowest_key;
 		n->values[index + 1] = res.nodes[1].loc;
+
+		*result = MERGED_INTO_TWO;
 	} else {
 		n->keys[index] = res.nodes[0].lowest_key;
 		n->values[index] = res.nodes[0].loc;
@@ -617,6 +640,8 @@ static int rebalance3(struct insert_args *args, struct internal_node *n, unsigne
 		n->values[index + 1] = res.nodes[1].loc;
 		n->keys[index + 2] = res.nodes[2].lowest_key;
 		n->values[index + 2] = res.nodes[2].loc;
+
+		*result = MERGED_INTO_ONE;
 	}
 
 out:
@@ -626,7 +651,7 @@ out:
 	return r;
 }
 
-static int rebalance2(struct insert_args *args, struct internal_node *n, unsigned index)
+static int rebalance2(struct insert_args *args, struct internal_node *n, unsigned index, int *result)
 {
 	int r;
 	struct rebalance_result res;
@@ -659,11 +684,15 @@ static int rebalance2(struct insert_args *args, struct internal_node *n, unsigne
 			n->values[index] = res.nodes[0].loc;
 			internal_erase(n, index + 1);
 		}
+
+		*result = MERGED_INTO_ONE;
 	} else {
 		n->keys[index] = res.nodes[0].lowest_key;
 		n->values[index] = res.nodes[0].loc;
 		n->keys[index + 1] = res.nodes[1].lowest_key;
 		n->values[index + 1] = res.nodes[1].loc;
+
+		*result = REDIST2;
 	}
 
 out:
@@ -672,22 +701,22 @@ out:
 	return r;
 }
 
-static int refill(struct insert_args *args, struct internal_node *n, unsigned index)
+static int refill(struct insert_args *args, struct internal_node *n, unsigned index, int *res)
 {
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
 	BUG_ON(nr_entries < 2);
 
 	if (index == 0)
-		rebalance2(args, n, 0);
+		rebalance2(args, n, 0, res);
 	else if (index == nr_entries - 1)
-		rebalance2(args, n, nr_entries - 2);
+		rebalance2(args, n, nr_entries - 2, res);
 	else
-		rebalance3(args, n, index - 1);
+		rebalance3(args, n, index - 1, res);
 
 	return 0;
 }
 
-static int rebalance(struct insert_args *args, struct internal_node *n, unsigned index)
+static int rebalance(struct insert_args *args, struct internal_node *n, unsigned index, int *res)
 {
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
 	unsigned free_space;
@@ -701,7 +730,7 @@ static int rebalance(struct insert_args *args, struct internal_node *n, unsigned
 			return r;
 
 		if (free_space > 8) {
-			rebalance2(args, n, index - 1);
+			rebalance2(args, n, index - 1, res);
 			return 0;
 		}
 	}
@@ -711,8 +740,13 @@ static int rebalance(struct insert_args *args, struct internal_node *n, unsigned
 		if (r)
 			return r;
 
-		if (free_space > 8)
-			rebalance2(args, n, index);
+		if (free_space > 8) {
+			rebalance2(args, n, index, res);
+		} else {
+			*res = NOTHING;
+		}
+	} else {
+	    *res = NOTHING;
 	}
 
 	return 0;
@@ -724,7 +758,8 @@ static int internal_insert(struct insert_args *args, struct dm_block *b, struct 
 	dm_block_t child_b;
 	struct internal_node *n = dm_block_data(b);
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
-	
+	int rebalance_outcome = 0;
+
 	i = lower_bound(n->keys, nr_entries, args->v->thin_begin);
 	if (i < 0)
 		i = 0;
@@ -733,26 +768,36 @@ static int internal_insert(struct insert_args *args, struct dm_block *b, struct 
 	r = insert_aux(args, child_b, res);
 
 	if (res->nr_nodes == 1) {
-		unsigned nr_entries = res->nodes[0].nr_entries;
+		nr_entries = res->nodes[0].nr_entries;
 
 		n->keys[i] = cpu_to_le64(res->nodes[0].lowest_key);
 		n->values[i] = cpu_to_le64(res->nodes[0].loc);
 
 		// FIXME: this should depend on whether it's a leaf or internal
 		if (res->flags == INTERNAL_NODE) {
-			if (nr_entries == INTERNAL_NR_ENTRIES)
-				rebalance(args, n, i);
-			else if (nr_entries < 80)
-				refill(args, n, i);
+			if (nr_entries == INTERNAL_NR_ENTRIES) {
+				rebalance(args, n, i, &rebalance_outcome);
+				res->action[INTERNAL_OVERFLOW]++;
+			} else if (nr_entries < 100) {
+				//rebalance(args, n, i);
+				refill(args, n, i, &rebalance_outcome);
+				res->action[INTERNAL_UNDERFLOW]++;
+			}
 		} else if (nr_entries == LEAF_NR_ENTRIES) {
-			rebalance(args, n, i);
+			rebalance(args, n, i, &rebalance_outcome);
+			res->action[LEAF_OVERFLOW]++;
 		} else if (nr_entries < 80) {
-			refill(args, n, i);
+			//rebalance(args, n, i);
+			refill(args, n, i, &rebalance_outcome);
+			res->action[LEAF_UNDERFLOW]++;
 		}
 
 		res->nr_nodes = 1;
 		init_node_info(&res->nodes[0], dm_block_location(b),
                                le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+
+		if (rebalance_outcome > 0)
+			res->stats[rebalance_outcome]++;
 	} else {
 		n->keys[i] = cpu_to_le64(res->nodes[0].lowest_key);
 		n->values[i] = cpu_to_le64(res->nodes[0].loc);
@@ -796,6 +841,7 @@ static int internal_insert(struct insert_args *args, struct dm_block *b, struct 
 	                               le64_to_cpu(sib_n->keys[0]), le32_to_cpu(sib_n->header.nr_entries));
 
 			dm_tm_unlock(args->tm, sib);
+			res->action[INTERNAL_SPLIT]++;
 		}
 	}
 
@@ -1163,6 +1209,8 @@ static int insert_into_leaf(struct insert_args *args, struct dm_block *b, unsign
                                le64_to_cpu(sib_n->keys[0]), le32_to_cpu(sib_n->header.nr_entries));
 
 		dm_tm_unlock(args->tm, sib);
+
+		res->action[LEAF_SPLIT]++;
 	} else {
 		leaf_insert_(n, args->v, index);
 		res->nr_nodes = 1;
@@ -1452,9 +1500,9 @@ int dm_rtree_insert(struct dm_transaction_manager *tm,
                     dm_block_t root,
                     struct dm_mapping *value, dm_block_t *new_root, unsigned *nr_inserts)
 {
-	int r;
+	int r, i, j;
 	struct insert_args args = {.tm = tm, .data_sm = data_sm, .v = value};
-	struct insert_result res;
+	struct insert_result res = {0};
 	r = insert_aux(&args, root, &res);
 	if (r)
 		return r;
@@ -1482,6 +1530,23 @@ int dm_rtree_insert(struct dm_transaction_manager *tm,
 		*new_root = dm_block_location(b);
 		dm_tm_unlock(tm, b);
 	}
+
+	/*for (i = 1; i <= 6; i++) {
+		if (res.action[i] > 0)
+			break;
+	}
+	for (j = 1; j <= 5; j++) {
+		if (res.stats[j] > 0)
+			break;
+	}
+	if (i <= 6 || j <= 5) {
+		printk(KERN_DEBUG "leaf: 0 s%u o%u u%u", res.action[LEAF_SPLIT], res.action[LEAF_OVERFLOW], res.action[LEAF_UNDERFLOW]);
+		printk(KERN_DEBUG "internal: s%u o%u u%u", res.action[INTERNAL_SPLIT], res.action[INTERNAL_OVERFLOW], res.action[INTERNAL_UNDERFLOW]);
+		printk(KERN_DEBUG "0 %u 2r%u 3r%u", res.stats[NOTHING], res.stats[REDIST2], res.stats[REDIST3]);
+		printk(KERN_DEBUG "1m%u 2m%u", res.stats[MERGED_INTO_ONE], res.stats[MERGED_INTO_TWO]);
+	}*/
+
+	dm_tm_update_stats(tm, res.action, res.stats);
 
 	return 0;
 }
