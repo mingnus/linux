@@ -941,7 +941,7 @@ static void leaf_rebalance2(struct dm_transaction_manager *tm,
 	uint32_t nr_left = le32_to_cpu(l->header.nr_entries);
 	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
 
-	if (nr_left + nr_right <= LEAF_NR_ENTRIES) {
+	if (nr_left + nr_right <= LEAF_NR_ENTRIES - 8) {
 		/* merge the two nodes */
 		leaf_shift(left, right, -nr_right);
 		dm_tm_dec(tm, dm_block_location(right));
@@ -970,7 +970,7 @@ static void leaf_delete_center_node(struct dm_transaction_manager *tm,
 	uint32_t nr_center = le32_to_cpu(c->header.nr_entries);
 	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
 
-	unsigned shift = min((uint32_t)LEAF_NR_ENTRIES - nr_left, nr_center);
+	unsigned shift = min((uint32_t)LEAF_NR_ENTRIES - nr_left - 8, nr_center);
 
 	BUG_ON(nr_left + shift > LEAF_NR_ENTRIES);
 	leaf_shift(left, center, -shift);
