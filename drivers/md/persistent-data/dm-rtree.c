@@ -1318,6 +1318,7 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 	res->nodes[0].loc = dm_block_location(b);
 	res->nodes[0].lowest_key = le64_to_cpu(n->keys[0]);
 	res->nodes[0].nr_entries = le32_to_cpu(n->header.nr_entries);
+	res->flags = LEAF_NODE;
 
 	return 0;
 }
