@@ -92,6 +92,33 @@ struct insert_result {
 	unsigned stats[8];
 };
 
+enum range_relation {
+	DISJOINTED = 0x1,
+	ADJACENTED = 0x2,
+	OVERLAPPED_ALL = 0x4,
+	OVERLAPPED_HEAD = 0x8,
+	OVERLAPPED_TAIL = 0x10,
+	OVERLAPPED_PARTIAL = 0x20,
+	OVERLAPPED_CENTER = 0x40,
+};
+
+enum value_compatibility {
+	INCOMPATIBLE = 0x100, // FIXME: do we really need an incompatible flag?
+	COMPATIBLE   = 0x200,
+};
+
+enum leaf_insert_actions {
+	NOOP = 0,
+	PUSH_BACK,	// LEFT | ADJACENTED | COMPATIBLE,
+	PUSH_FRONT,	//  RIGHT | ADJACENTED | COMPATIBLE,
+	MERGE,		// LEFT | RIGHT | ADJACENTED | COMPATIBLE,
+	TRUNCATE_BACK,	// LEFT | OVERLAPPED_TAIL | INCOMPATIBLE,
+	TRUNCATE_FRONT,	// LEFT | OVERLAPPED_HEAD | INCOMPATIBLE,
+	REPLACE,	// LEFT | OVERLAP_ALL | INCOMPATIBLE
+	INSERT_NEW,	// ADJACENTED-INCOMPATIBLE, DISJOINT-*
+	SPLIT,		// LEFT | OVERLAPPED_CENTER | INCOMPATIBLE,
+};
+
 struct remove_args {
 	struct dm_transaction_manager *tm;
 	struct dm_space_map *data_sm;
@@ -875,6 +902,39 @@ static bool adjacent_mapping(struct dm_mapping *left, struct dm_mapping *right)
                (left->time == right->time);
 }
 
+static int test_relation(struct dm_mapping *left, struct dm_mapping *right)
+{
+	uint64_t thin_delta = right->thin_begin - left->thin_begin;
+	int flags = 0;
+
+	if ((left->data_begin + (uint64_t)left->len == right->data_begin) &&
+            (left->time == right->time))
+		flags |= COMPATIBLE;
+	else
+		flags |= INCOMPATIBLE;
+
+	if (thin_delta == left->len)
+		flags |= ADJACENTED;
+	else if (thin_delta > left->len)
+		flags |= DISJOINTED;
+	else {
+		uint64_t left_end = left->thin_begin + (uint64_t)left->len;
+		uint64_t right_end = right->thin_begin + (uint64_t)right->len;
+		if (thin_delta == 0 && left_end == right_end)
+			flags |= OVERLAPPED_ALL;
+		else if (thin_delta == 0)
+			flags |= OVERLAPPED_HEAD;
+		else if (left_end == right_end)
+			flags |= OVERLAPPED_TAIL;
+		else if (left_end < right_end)
+			flags |= OVERLAPPED_PARTIAL;
+		else
+			flags |= OVERLAPPED_CENTER;
+	}
+
+	return flags;
+}
+
 static void leaf_move(struct leaf_node *n, int shift)
 {
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
@@ -1231,87 +1291,186 @@ static void erase_from_leaf(struct leaf_node *node, unsigned index)
 	node->header.nr_entries = cpu_to_le32(nr_entries - 1);
 }
 
+static int get_mapping(struct leaf_node *n, int i, struct dm_mapping *out)
+{
+	struct disk_mapping *m = n->values + i;
+	out->thin_begin = le64_to_cpu(n->keys[i]);
+	out->data_begin = le64_to_cpu(m->data_begin);
+	out->len = le32_to_cpu(m->len);
+	out->time = le32_to_cpu(m->time);
+	return 0;
+}
+
+static int action_to_left(struct dm_mapping *left, struct dm_mapping *right) {
+	int relation = test_relation(left, right);
+
+	// assume that right.len == 1, the relation falls into those categories:
+	switch (relation) {
+		case (ADJACENTED | COMPATIBLE): return PUSH_BACK;
+		case (ADJACENTED | INCOMPATIBLE):
+		case (DISJOINTED | INCOMPATIBLE):
+		case (DISJOINTED | COMPATIBLE): return INSERT_NEW;
+		case (OVERLAPPED_ALL | INCOMPATIBLE): return REPLACE;
+		case (OVERLAPPED_HEAD | INCOMPATIBLE): return TRUNCATE_FRONT;
+		case (OVERLAPPED_TAIL | INCOMPATIBLE): return TRUNCATE_BACK;
+		case (OVERLAPPED_CENTER | INCOMPATIBLE): return SPLIT;
+		default: return NOOP; // incl. all other overlapped but compatible cases
+	}
+}
+
+static int action_to_right(struct dm_mapping *left, struct dm_mapping *right) {
+	int relation = test_relation(left, right);
+
+	// assume that left.len == 1, the relation falls into these categories:
+	switch (relation) {
+		case (ADJACENTED | COMPATIBLE): return PUSH_FRONT;
+		case (ADJACENTED | INCOMPATIBLE):
+		case (DISJOINTED | INCOMPATIBLE):
+		case (DISJOINTED | COMPATIBLE): return INSERT_NEW;
+		default: return NOOP; // not possible
+	}
+}
+
+static void set_len(struct leaf_node *n, int i, uint32_t len) {
+	struct disk_mapping *disk = n->values + i;
+	disk->len = cpu_to_le32(len);
+}
+
+static void truncate_front(struct leaf_node *n, int i, uint32_t len) {
+	struct dm_mapping m;
+	struct disk_mapping *disk = n->values + i;
+	uint64_t delta;
+
+	get_mapping(n, i, &m);
+	delta = (uint64_t)m.len - (uint64_t)len; // cast to u64 to support underflow
+	n->keys[i] = cpu_to_le64(m.thin_begin + delta);
+	disk->data_begin = cpu_to_le64(m.data_begin + delta);
+	disk->len = cpu_to_le32(len);
+}
+
+// FIXME: similar to the case (e) in remove_leaf_()
+// TODO: dec ref counts
+static int remove_middle_(struct dm_transaction_manager *tm, struct dm_space_map *data_sm, struct dm_block *b, int i, uint64_t thin_begin, uint64_t thin_end, struct insert_result *res)
+{
+	struct dm_mapping m;
+	struct dm_mapping back_half;
+	struct insert_args i_args;
+	struct leaf_node *n;
+	uint64_t padding;
+
+	n = dm_block_data(b);
+	get_mapping(n, i, &m);
+
+	/* truncate the front half */
+	set_len(n, i, thin_begin - m.thin_begin);
+
+	/* insert new back half entry */
+	padding = thin_end - m.thin_begin;
+
+	back_half.thin_begin = thin_end;
+	back_half.data_begin = m.data_begin + padding;
+	back_half.len = m.len - padding;
+	back_half.time = m.time;
+
+	i_args.tm = tm;
+	i_args.data_sm = data_sm;
+	i_args.v = &back_half;
+
+	return insert_into_leaf(&i_args, b, i, res);
+}
+
+static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i, struct insert_result *res)
+{
+	struct insert_result i_res;
+	struct dm_block *sib_b;
+	struct dm_block_manager *bm;
+	bool overwrite_at_right = false;
+
+	// remove the middle part
+	remove_middle_(args->tm, args->data_sm, b, i, args->v->thin_begin, args->v->thin_begin + args->v->len, &i_res);
+
+	// choose which sibling to overwrite
+	if (i_res.nr_nodes == 2 && args->v->thin_begin >= i_res.nodes[1].lowest_key) {
+		bm = dm_tm_get_bm(args->tm);
+		dm_bm_write_lock(bm, i_res.nodes[1].loc, &validator, &sib_b);
+		b = dm_block_data(sib_b);
+		i -= i_res.nodes[0].nr_entries;
+		overwrite_at_right = true;
+	}
+
+	insert_into_leaf(args, b, i, res);
+
+	// return results
+	res->nr_nodes = i_res.nr_nodes;
+	if (overwrite_at_right) {
+		res->nodes[1] = res->nodes[0];
+		res->nodes[0] = i_res.nodes[0];
+	} else if (i_res.nr_nodes > 1) {
+		res->nodes[1] = i_res.nodes[1];
+	}
+
+	return 0;
+}
+
 static int leaf_insert(struct insert_args *args, struct dm_block *b, struct insert_result *res)
 {
 	int i;
 	struct leaf_node *n = dm_block_data(b);
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
+	struct dm_mapping left;
+	struct dm_mapping right;
 	struct dm_mapping *value = args->v;
-
-	// FIXME: would this be better named 'index'
-	i = lower_bound(n->keys, nr_entries, args->v->thin_begin);
+	int action = 0;
 
 	if (nr_entries == 0) {
 		return insert_into_leaf(args, b, 0, res);
+	}
 
-	} else if (i < 0) {
-		struct disk_mapping *m = n->values + 0;
-		struct dm_mapping right;
+	// FIXME: would this be better named 'index'
+	i = lower_bound(n->keys, nr_entries, args->v->thin_begin);
+	if (i >= 0 && i < nr_entries)
+		get_mapping(n, i, &left);
+	if (i + 1 < nr_entries)
+		get_mapping(n, i + 1, &right);
 
-		right.thin_begin = le64_to_cpu(n->keys[0]);
-		right.data_begin = le64_to_cpu(m->data_begin);
-		right.len = le32_to_cpu(m->len);
-		right.time = le32_to_cpu(m->time);
-		
-		if (adjacent_mapping(args->v, &right)) {
-			n->keys[0] = cpu_to_le64(value->thin_begin);
-			m->data_begin = cpu_to_le64(value->data_begin);
-			m->len = cpu_to_le32(value->len + right.len);
-		} else {
-			/* new entry goes at start */
-			return insert_into_leaf(args, b, 0, res);
-		}
-
+	// currently support inserting len-1 ranges only
+	if (i < 0) {
+		action = action_to_right(value, &right);
 	} else if (i == nr_entries - 1) {
-		/* check for adjacency on left */
-		struct disk_mapping *m = n->values + i;
-		struct dm_mapping left;
-
-		left.thin_begin = le64_to_cpu(n->keys[i]);
-		left.data_begin = le64_to_cpu(m->data_begin);
-		left.len = le32_to_cpu(m->len);
-		left.time = le32_to_cpu(m->time);
-
-		if (adjacent_mapping(&left, value)) {
-			m->len = cpu_to_le32(left.len + args->v->len);
-		} else {
-			return insert_into_leaf(args, b, i + 1, res);
-		}
-
+		action = action_to_left(&left, value);
 	} else {
-		struct dm_mapping left;
-		struct dm_mapping right;
-		struct disk_mapping *lm = n->values + i;
-		struct disk_mapping *rm = n->values + i + 1;
+		action = action_to_left(&left, value);
+		if (action == PUSH_BACK)
+			if (action_to_right(value, &right) == PUSH_FRONT)
+				action = MERGE;
+		else if (action == INSERT_NEW)
+			action = action_to_right(value, &right);
+	}
 
-		left.thin_begin = le64_to_cpu(n->keys[i]);
-		left.data_begin = le64_to_cpu(lm->data_begin);
-		left.len = le32_to_cpu(lm->len);
-		left.time = le32_to_cpu(lm->time);
-
-		right.thin_begin = le64_to_cpu(n->keys[i + 1]);
-		right.data_begin = le64_to_cpu(rm->data_begin);
-		right.len = le32_to_cpu(rm->len);
-		right.time = le32_to_cpu(rm->time);
-
-		if (adjacent_mapping(&left, value)) {
-			if (adjacent_mapping(value, &right)) {
-				/* adjacent to both left and right */
-				lm->len = cpu_to_le32(left.len + args->v->len + right.len);
-				erase_from_leaf(n, i + 1);
-			} else {
-				/* adjacent to left only */
-				lm->len = cpu_to_le32(left.len + args->v->len);
-			}
-		} else if (adjacent_mapping(value, &right)) {
-			/* adjacent to right only */
-			n->keys[i + 1] = cpu_to_le64(args->v->thin_begin);
-			rm->data_begin = cpu_to_le64(args->v->data_begin);
-			rm->len = cpu_to_le32(value->len + right.len);
-		} else {
-			/* not adjacent */
+	switch (action) {
+		case PUSH_BACK:
+			set_len(n, i, left.len + 1);
+			break;
+		case PUSH_FRONT:
+			truncate_front(n, i + 1, right.len + 1);
+			break;
+		case MERGE:
+			erase_from_leaf(n, i + 1);
+			set_len(n, i, left.len + right.len + 1);
+			break;
+		case TRUNCATE_BACK:
+			set_len(n, i, left.len - 1);
 			return insert_into_leaf(args, b, i + 1, res);
-		}
+		case TRUNCATE_FRONT:
+			truncate_front(n, i, left.len - 1);
+			return insert_into_leaf(args, b, i, res);
+		case REPLACE:
+			erase_from_leaf(n, i); // FIXME: do not erase to avoid memmove
+			return insert_into_leaf(args, b, i, res);
+		case INSERT_NEW:
+			return insert_into_leaf(args, b, i + 1, res);
+		case SPLIT:
+			return overwrite_middle(args, b, i, res);
 	}
 
 	res->nr_nodes = 1;
