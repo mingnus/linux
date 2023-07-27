@@ -110,8 +110,13 @@ enum value_compatibility {
 enum leaf_insert_actions {
 	NOOP = 0,
 	PUSH_BACK,	// LEFT | ADJACENTED | COMPATIBLE,
+	PUSH_BACK_REPLACED,
+	PUSH_BACK_TRUNCATED,
 	PUSH_FRONT,	//  RIGHT | ADJACENTED | COMPATIBLE,
+	PUSH_FRONT_REPLACED,
+	PUSH_FRONT_TRUNCATED,
 	MERGE,		// LEFT | RIGHT | ADJACENTED | COMPATIBLE,
+	MERGE_REPLACED,
 	TRUNCATE_BACK,	// LEFT | OVERLAPPED_TAIL | INCOMPATIBLE,
 	TRUNCATE_FRONT,	// LEFT | OVERLAPPED_HEAD | INCOMPATIBLE,
 	REPLACE,	// LEFT | OVERLAP_ALL | INCOMPATIBLE
@@ -1417,6 +1422,7 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 	int i;
 	struct leaf_node *n = dm_block_data(b);
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
+	struct dm_mapping center;
 	struct dm_mapping left;
 	struct dm_mapping right;
 	struct dm_mapping *value = args->v;
@@ -1429,40 +1435,84 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 	// FIXME: would this be better named 'index'
 	i = lower_bound(n->keys, nr_entries, args->v->thin_begin);
 	if (i >= 0 && i < nr_entries)
-		get_mapping(n, i, &left);
+		get_mapping(n, i, &center);
+	if (i > 0)
+		get_mapping(n, i - 1, &left);
 	if (i + 1 < nr_entries)
 		get_mapping(n, i + 1, &right);
 
 	// currently support inserting len-1 ranges only
 	if (i < 0) {
 		action = action_to_right(value, &right);
-	} else if (i == nr_entries - 1) {
-		action = action_to_left(&left, value);
 	} else {
-		action = action_to_left(&left, value);
-		if (action == PUSH_BACK)
-			if (action_to_right(value, &right) == PUSH_FRONT)
-				action = MERGE;
-		else if (action == INSERT_NEW)
-			action = action_to_right(value, &right);
+		action = action_to_left(&center, value);
+		switch (action) {
+			case REPLACE:
+				if (i > 0 && action_to_left(&left, value) == PUSH_BACK) {
+					if (i + 1 < nr_entries &&
+					    action_to_right(value, &right) == PUSH_FRONT)
+						action = MERGE_REPLACED;
+					else
+						action = PUSH_BACK_REPLACED;
+				} else if (i + 1 < nr_entries &&
+					   action_to_right(value, &right) == PUSH_FRONT)
+					action = PUSH_FRONT_REPLACED;
+				break;
+			case TRUNCATE_FRONT:
+				if (i > 0 && action_to_left(&left, value) == PUSH_BACK)
+					action = PUSH_BACK_TRUNCATED;
+				break;
+			case TRUNCATE_BACK:
+				if (i + 1 < nr_entries && action_to_right(value, &right) == PUSH_FRONT)
+					action = PUSH_FRONT_TRUNCATED;
+				break;
+			case PUSH_BACK:
+				if (i + 1 < nr_entries && action_to_right(value, &right) == PUSH_FRONT)
+					action = MERGE;
+				break;
+			case INSERT_NEW:
+				action = action_to_right(value, &right);
+				break;
+		}
 	}
 
 	switch (action) {
 		case PUSH_BACK:
-			set_len(n, i, left.len + 1);
+			set_len(n, i, center.len + 1);
+			break;
+		case PUSH_BACK_REPLACED:
+			erase_from_leaf(n, i);
+			set_len(n, i - 1, left.len + 1);
+			break;
+		case PUSH_BACK_TRUNCATED:
+			truncate_front(n, i, center.len - 1);
+			set_len(n, i - 1, left.len + 1);
 			break;
 		case PUSH_FRONT:
 			truncate_front(n, i + 1, right.len + 1);
 			break;
+		case PUSH_FRONT_REPLACED:
+			erase_from_leaf(n, i);
+			truncate_front(n, i + 1, right.len + 1);
+			break;
+		case PUSH_FRONT_TRUNCATED:
+			set_len(n, i, center.len - 1);
+			truncate_front(n, i + 1, right.len + 1);
+			break;
 		case MERGE:
+			erase_from_leaf(n, i + 1);
+			set_len(n, i, center.len + right.len + 1);
+			break;
+		case MERGE_REPLACED:
+			erase_from_leaf(n, i); // FIXME: do not memmove twice
 			erase_from_leaf(n, i + 1);
 			set_len(n, i, left.len + right.len + 1);
 			break;
 		case TRUNCATE_BACK:
-			set_len(n, i, left.len - 1);
+			set_len(n, i, center.len - 1);
 			return insert_into_leaf(args, b, i + 1, res);
 		case TRUNCATE_FRONT:
-			truncate_front(n, i, left.len - 1);
+			truncate_front(n, i, center.len - 1);
 			return insert_into_leaf(args, b, i, res);
 		case REPLACE:
 			erase_from_leaf(n, i); // FIXME: do not erase to avoid memmove
