@@ -1306,10 +1306,12 @@ static int get_mapping(struct leaf_node *n, int i, struct dm_mapping *out)
 	return 0;
 }
 
+// FIXME: check for range length overflow
 static int action_to_left(struct dm_mapping *left, struct dm_mapping *right) {
 	int relation = test_relation(left, right);
 
-	// assume that right.len == 1, the relation falls into those categories:
+	// assume that right.len == 1, the relation falls into those categories,
+	// in which OVERLAPPED_PARTIAL is not possible:
 	switch (relation) {
 		case (ADJACENTED | COMPATIBLE): return PUSH_BACK;
 		case (ADJACENTED | INCOMPATIBLE):
@@ -1323,10 +1325,11 @@ static int action_to_left(struct dm_mapping *left, struct dm_mapping *right) {
 	}
 }
 
+// FIXME: check for range length overflow
 static int action_to_right(struct dm_mapping *left, struct dm_mapping *right) {
 	int relation = test_relation(left, right);
-
-	// assume that left.len == 1, the relation falls into these categories:
+	// assume that left.len == 1, the relation falls into these categories,
+	// in which OVERLAPPED_PARTIAL is not possible:
 	switch (relation) {
 		case (ADJACENTED | COMPATIBLE): return PUSH_FRONT;
 		case (ADJACENTED | INCOMPATIBLE):
@@ -1381,7 +1384,7 @@ static int remove_middle_(struct dm_transaction_manager *tm, struct dm_space_map
 	i_args.data_sm = data_sm;
 	i_args.v = &back_half;
 
-	return insert_into_leaf(&i_args, b, i, res);
+	return insert_into_leaf(&i_args, b, i + 1, res);
 }
 
 static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i, struct insert_result *res)
@@ -1390,26 +1393,34 @@ static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i,
 	struct dm_block *sib_b;
 	struct dm_block_manager *bm;
 	bool overwrite_at_right = false;
+	int r;
 
 	// remove the middle part
-	remove_middle_(args->tm, args->data_sm, b, i, args->v->thin_begin, args->v->thin_begin + args->v->len, &i_res);
+	r = remove_middle_(args->tm, args->data_sm, b, i, args->v->thin_begin, args->v->thin_begin + args->v->len, &i_res);
+	if (r)
+	    return r;
 
 	// choose which sibling to overwrite
 	if (i_res.nr_nodes == 2 && args->v->thin_begin >= i_res.nodes[1].lowest_key) {
 		bm = dm_tm_get_bm(args->tm);
-		dm_bm_write_lock(bm, i_res.nodes[1].loc, &validator, &sib_b);
+		r = dm_bm_write_lock(bm, i_res.nodes[1].loc, &validator, &sib_b);
+		if (r)
+			return r;
 		b = dm_block_data(sib_b);
 		i -= i_res.nodes[0].nr_entries;
 		overwrite_at_right = true;
 	}
 
-	insert_into_leaf(args, b, i, res);
+	r = insert_into_leaf(args, b, i + 1, res);
+	if (r)
+	    return r;
 
 	// return results
 	res->nr_nodes = i_res.nr_nodes;
 	if (overwrite_at_right) {
 		res->nodes[1] = res->nodes[0];
 		res->nodes[0] = i_res.nodes[0];
+		dm_bm_unlock(sib_b);
 	} else if (i_res.nr_nodes > 1) {
 		res->nodes[1] = i_res.nodes[1];
 	}
@@ -1493,7 +1504,7 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 			break;
 		case PUSH_FRONT_REPLACED:
 			erase_from_leaf(n, i);
-			truncate_front(n, i + 1, right.len + 1);
+			truncate_front(n, i, right.len + 1);
 			break;
 		case PUSH_FRONT_TRUNCATED:
 			set_len(n, i, center.len - 1);
@@ -1505,8 +1516,8 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 			break;
 		case MERGE_REPLACED:
 			erase_from_leaf(n, i); // FIXME: do not memmove twice
-			erase_from_leaf(n, i + 1);
-			set_len(n, i, left.len + right.len + 1);
+			erase_from_leaf(n, i);
+			set_len(n, i - 1, left.len + right.len + 1);
 			break;
 		case TRUNCATE_BACK:
 			set_len(n, i, center.len - 1);
