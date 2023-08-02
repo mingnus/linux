@@ -1389,38 +1389,41 @@ static int remove_middle_(struct dm_transaction_manager *tm, struct dm_space_map
 static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i, struct insert_result *res)
 {
 	struct insert_result i_res;
-	struct dm_block *sib_b;
 	struct dm_block_manager *bm;
 	bool overwrite_at_right = false;
 	int r;
 
-	// remove the middle part
+	// remove the middle part (might split)
 	r = remove_middle_(args->tm, args->data_sm, b, i, args->v->thin_begin, args->v->thin_begin + args->v->len, &i_res);
 	if (r)
 	    return r;
 
-	// choose which sibling to overwrite
+	// choose which sibling to insert the overwritten key
 	if (i_res.nr_nodes == 2 && args->v->thin_begin >= i_res.nodes[1].lowest_key) {
 		bm = dm_tm_get_bm(args->tm);
-		r = dm_bm_write_lock(bm, i_res.nodes[1].loc, &validator, &sib_b);
+		r = dm_bm_write_lock(bm, i_res.nodes[1].loc, &validator, &b);
 		if (r)
 			return r;
-		b = dm_block_data(sib_b);
 		i -= i_res.nodes[0].nr_entries;
 		overwrite_at_right = true;
 	}
 
+	// do overwriting (might split if it didn't splitted previously)
 	r = insert_into_leaf(args, b, i + 1, res);
-	if (r)
-	    return r;
+	if (r) {
+		if (overwrite_at_right)
+			dm_bm_unlock(b);
+		return r;
+	}
 
 	// return results
-	res->nr_nodes = i_res.nr_nodes;
 	if (overwrite_at_right) {
+		res->nr_nodes = i_res.nr_nodes;
 		res->nodes[1] = res->nodes[0];
 		res->nodes[0] = i_res.nodes[0];
-		dm_bm_unlock(sib_b);
-	} else if (i_res.nr_nodes > 1) {
+		dm_bm_unlock(b);
+	} else if (i_res.nr_nodes == 2) {
+		res->nr_nodes = i_res.nr_nodes;
 		res->nodes[1] = i_res.nodes[1];
 	}
 
