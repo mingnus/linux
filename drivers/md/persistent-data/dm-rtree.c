@@ -911,7 +911,7 @@ static int test_relation(struct dm_mapping *left, struct dm_mapping *right)
 	uint64_t thin_delta = right->thin_begin - left->thin_begin;
 	int flags = 0;
 
-	if ((left->data_begin + (uint64_t)left->len == right->data_begin) &&
+	if ((left->data_begin + thin_delta == right->data_begin) &&
             (left->time == right->time))
 		flags |= COMPATIBLE;
 	else
