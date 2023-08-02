@@ -10,7 +10,6 @@
 #include <linux/device-mapper.h>
 
 #define DM_MSG_PREFIX "btree"
-#define SKIP_DATA_SM 1
 
 /*----------------------------------------------------------------*/
 
