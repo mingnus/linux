@@ -36,11 +36,11 @@ struct node_header {
 } __attribute__((packed, aligned(8)));
 
 // FIXME: if we shrink data_begin to 32bits, then we'll have to aligned(4)
+// FIXME: compound the data_begin & len_time into a single le64 to avoid dereferencing twice?
 struct disk_mapping {
-	__le64 data_begin;
-	__le32 len;
-	__le32 time;
-} __attribute__((packed, aligned(8)));
+	__le32 data_begin;
+	__le32 len_time;
+} __attribute__((packed, aligned(4)));
 
 /*
  * We hold an extra key in these nodes so we know the end value for the highest
@@ -223,6 +223,37 @@ struct dm_block_validator validator = {
 	.prepare_for_write = node_prep,
 	.check = node_check
 };
+
+/*----------------------------------------------------------------*/
+
+static void unpack_len_time(uint32_t len_time, uint32_t *len, uint32_t *time)
+{
+	*len = len_time >> 20;
+	*time = len_time & ((1 << 20) - 1);
+}
+
+static uint32_t pack_len_time(uint32_t len, uint32_t time)
+{
+	return len << 20 | time;
+}
+
+static int get_mapping(struct leaf_node *n, int i, struct dm_mapping *out)
+{
+	struct disk_mapping *value_le = n->values + i;
+	out->thin_begin = le64_to_cpu(n->keys[i]);
+	out->data_begin = le32_to_cpu(value_le->data_begin);
+	unpack_len_time(le32_to_cpu(value_le->len_time), &out->len, &out->time);
+	return 0;
+}
+
+// FIXME: accepts disk_mapping rather than leaf_node
+static void set_len(struct leaf_node *n, int i, uint32_t len) {
+	struct disk_mapping *value_le = n->values + i;
+	uint32_t len_time = le32_to_cpu(value_le->len_time);
+	len_time &= (1 << 20) - 1;
+	len_time |= (len << 20);
+	value_le->len_time = cpu_to_le32(len_time);
+}
 
 /*----------------------------------------------------------------*/
 
@@ -574,11 +605,12 @@ static int inc_children(struct dm_transaction_manager *tm, struct dm_space_map *
 	} else if (flags == LEAF_NODE) {
 		struct leaf_node *n = (struct leaf_node*)h;
 		int i;
-		for (i = 0; i < nr_entries; i++) {
-			struct disk_mapping *m = n->values + i;
-			dm_block_t data_begin = le64_to_cpu(m->data_begin);
-			dm_block_t data_end = data_begin + le32_to_cpu(m->len);
-			dm_sm_inc_blocks(data_sm, data_begin, data_end);
+		for (i = 0; i < nr_entries; i++) { // FIXME: loop through the value ptr
+			struct dm_mapping m;
+			dm_block_t data_end;
+			get_mapping(n, i, &m);
+			data_end = m.data_begin + m.len;
+			dm_sm_inc_blocks(data_sm, m.data_begin, data_end);
 		}
 	} else {
 	    return -EINVAL;
@@ -1009,27 +1041,16 @@ static void leaf_shift(struct dm_block *left, struct dm_block *right, int count)
                  * Check to see if we can merge the last entry from the left
                  * node with the first entry from the right node.
                  */
-		struct disk_mapping *last_left = l->values + nr_left - 1;
-		struct dm_mapping ll = {
-			.thin_begin = l->keys[nr_left - 1],
-			.data_begin = le64_to_cpu(last_left->data_begin),
-			.len = le32_to_cpu(last_left->len),
-			.time = le32_to_cpu(last_left->time)
-		};
-                                        
-		struct disk_mapping *first_right = r->values;
-		struct dm_mapping fr = {
-			.thin_begin = r->keys[0],
-			.data_begin = le64_to_cpu(first_right->data_begin),
-			.len = le32_to_cpu(first_right->len),
-			.time = le32_to_cpu(first_right->time)
-		};
+		struct dm_mapping ll; // last left
+		struct dm_mapping fr; // first right
+		get_mapping(l, nr_left - 1, &ll);
+		get_mapping(r, 0, &fr);
 
 		if (adjacent_mapping(&ll, &fr)) {
 			l->header.nr_entries = cpu_to_le32(nr_left - 1);
 			r->keys[0] = l->keys[nr_left - 1];
 			r->values[0].data_begin = l->values[nr_left - 1].data_begin;
-			r->values[0].len = cpu_to_le32(ll.len + fr.len);
+			set_len(r, 0, ll.len + fr.len);
 
 			// Adjust the count, since there's one fewer entries in left now
 			if (count > 0)
@@ -1138,9 +1159,15 @@ static int leaf_del(struct del_args *args, struct dm_block *b)
 
 	/* release the data blocks */
 	for (i = 0; i < nr_entries; i++) {
-		struct disk_mapping *m = n->values + i;
-		dm_block_t data_begin = le64_to_cpu(m->data_begin);
-		dm_block_t data_end = data_begin + le32_to_cpu(m->len);
+		struct disk_mapping *value_le = n->values + i;
+		uint32_t len;
+		uint32_t time;
+		dm_block_t data_begin;
+		dm_block_t data_end;
+
+		unpack_len_time(value_le->len_time, &len, &time);
+		data_begin = le64_to_cpu(value_le->data_begin);
+		data_end = data_begin + len;
 		dm_sm_dec_blocks(args->data_sm, data_begin, data_end);
 	}
 #endif
@@ -1221,8 +1248,7 @@ static void leaf_insert_(struct leaf_node *n, struct dm_mapping *v, unsigned ind
 	__le64 key_le = cpu_to_le64(v->thin_begin);
 
 	value_le.data_begin = cpu_to_le64(v->data_begin);
-	value_le.len = cpu_to_le32(v->len);
-	value_le.time = cpu_to_le32(v->time);
+	value_le.len_time = cpu_to_le32(pack_len_time(v->len, v->time));
 
 	array_insert(n->keys, sizeof(n->keys[0]), nr_entries, index, &key_le);
 	array_insert(n->values, sizeof(n->values[0]), nr_entries, index, &value_le);
@@ -1295,16 +1321,6 @@ static void erase_from_leaf(struct leaf_node *node, unsigned index)
 	node->header.nr_entries = cpu_to_le32(nr_entries - 1);
 }
 
-static int get_mapping(struct leaf_node *n, int i, struct dm_mapping *out)
-{
-	struct disk_mapping *m = n->values + i;
-	out->thin_begin = le64_to_cpu(n->keys[i]);
-	out->data_begin = le64_to_cpu(m->data_begin);
-	out->len = le32_to_cpu(m->len);
-	out->time = le32_to_cpu(m->time);
-	return 0;
-}
-
 // FIXME: check for range length overflow
 static int action_to_left(struct dm_mapping *left, struct dm_mapping *right) {
 	int relation = test_relation(left, right);
@@ -1338,21 +1354,17 @@ static int action_to_right(struct dm_mapping *left, struct dm_mapping *right) {
 	}
 }
 
-static void set_len(struct leaf_node *n, int i, uint32_t len) {
-	struct disk_mapping *disk = n->values + i;
-	disk->len = cpu_to_le32(len);
-}
 
 static void truncate_front(struct leaf_node *n, int i, uint32_t len) {
 	struct dm_mapping m;
-	struct disk_mapping *disk = n->values + i;
+	struct disk_mapping *value_le = n->values + i;
 	uint64_t delta;
 
 	get_mapping(n, i, &m);
 	delta = (uint64_t)m.len - (uint64_t)len; // cast to u64 to support underflow
 	n->keys[i] = cpu_to_le64(m.thin_begin + delta);
-	disk->data_begin = cpu_to_le64(m.data_begin + delta);
-	disk->len = cpu_to_le32(len);
+	value_le->data_begin = cpu_to_le32(m.data_begin + delta);
+	value_le->len_time = cpu_to_le32(pack_len_time(len, m.time));
 }
 
 // FIXME: similar to the case (e) in remove_leaf_()
@@ -1633,29 +1645,17 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 			root = le64_to_cpu(n->values[i]);
 
 		else {
-			struct disk_mapping *v;
-			dm_block_t thin_begin, thin_end, data_begin, data_end;
-			uint32_t len, time;
-			
+			dm_block_t thin_end;
 			struct leaf_node *n = (struct leaf_node *) h;
 
-			v = n->values + i;
-			thin_begin = le64_to_cpu(n->keys[i]);
-			data_begin = le64_to_cpu(v->data_begin);
-			len = le32_to_cpu(v->len);
-			time = le32_to_cpu(v->time);
-			thin_end = thin_begin + len;
-			data_end = data_begin + len;
+			get_mapping(n, i, result);
+			thin_end = result->thin_begin + result->len;
 
 			if (key > thin_end) {
 				dm_tm_unlock(tm, b);
 				return -ENODATA;
 			}
 
-			result->thin_begin = thin_begin;
-			result->data_begin = data_begin;
-			result->len = len;
-			result->time = time;
 			found = true;
 		}
 
@@ -1723,7 +1723,7 @@ int dm_rtree_insert(struct dm_transaction_manager *tm,
                     dm_block_t root,
                     struct dm_mapping *value, dm_block_t *new_root, unsigned *nr_inserts)
 {
-	int r, i, j;
+	int r;
 	struct insert_args args = {.tm = tm, .data_sm = data_sm, .v = value};
 	struct insert_result res = {0};
 	r = insert_aux(&args, root, &res);
@@ -2004,9 +2004,8 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 {
 	int i, r;
 	unsigned within_start, within_end;
-	dm_block_t key;
-	struct disk_mapping *m;
-	uint32_t len;
+	struct disk_mapping *value_le;
+	struct dm_mapping m;
 	struct leaf_node *n = dm_block_data(block);
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
 
@@ -2018,61 +2017,44 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 	if (i < 0)
 		i = 0;
 
-	key = le64_to_cpu(n->keys[i]);
-	m = n->values + i;
-	len = le32_to_cpu(m->len);
+	value_le = n->values + i;
+	get_mapping(n, i, &m);
 
-	if (key < thin_begin && (key + len) > thin_end) {
+	if (m.thin_begin < thin_begin && (m.thin_begin + m.len) > thin_end) {
 		/* case e */
-		dm_block_t delta = thin_end - key;
-		struct dm_mapping back_half = {
-			.thin_begin = thin_end,
-			.data_begin = le64_to_cpu(m->data_begin) + delta,
-			.len = len - delta,
-			.time = m->time,
-		};
-		struct insert_args args = {.tm = tm, .data_sm = data_sm, .v = &back_half};
+		// FIXME: dec ref counts of removed blocks
 		struct insert_result insert_res;
-
-		/* truncate the front half */
-		m->len = cpu_to_le32(thin_begin - key);
-
-		/* insert new back half entry */
-		insert_into_leaf(&args, block, i + 1, &insert_res);
-
+		remove_middle_(tm, data_sm, block, i, thin_begin, thin_end, &insert_res);
 		res->nr_nodes = insert_res.nr_nodes;
 		memcpy(res->nodes, insert_res.nodes, sizeof(insert_res.nodes));
 	} else {
-		if (key + len <= thin_begin) {
+		if (m.thin_begin + m.len <= thin_begin) {
 			/* case a */
 			i++;
-		} else if ((key < thin_begin)) {
+		} else if (m.thin_begin < thin_begin) {
 			/* case b */
-			dm_block_t delta = thin_begin - key;
-			dm_block_t data_begin = le64_to_cpu(m->data_begin) + delta;
-			dm_block_t data_end = le64_to_cpu(m->data_begin) + len;
+			dm_block_t delta = thin_begin - m.thin_begin;
+			dm_block_t data_begin = m.data_begin + delta;
+			dm_block_t data_end = m.data_begin + m.len;
 			r = dm_sm_dec_blocks(data_sm, data_begin, data_end);
 			if (r)
 				return r;
-			m->len = cpu_to_le32(thin_begin - key);
+			set_len(n, i, thin_begin - m.thin_begin);
 			i++;
 		}
 
 		/* Collect entries that are entirely within the remove range */
 		within_start = i;
 		for (; i < nr_entries; i++) {
-			m = n->values + i;
-			key = le64_to_cpu(n->keys[i]);
-			len = le32_to_cpu(m->len);
+			get_mapping(n, i, &m);
 
-			if (key + len > thin_end)
+			if (m.thin_begin + m.len > thin_end)
 				break;
 
 			/* case c */
 			{
-	                        dm_block_t data_begin = le64_to_cpu(m->data_begin);
-	                        dm_block_t data_end = data_begin + len;
-	                        r = dm_sm_dec_blocks(data_sm, data_begin, data_end);
+	                        dm_block_t data_end = m.data_begin + m.len;
+	                        r = dm_sm_dec_blocks(data_sm, m.data_begin, data_end);
 	                        if (r)
 		                        return r;
 			}
@@ -2087,25 +2069,18 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 		}
 
 		if (i < nr_entries) {
-			key = le64_to_cpu(n->keys[i]);
-			m = n->values + i;
-			len = le32_to_cpu(m->len);
+			get_mapping(n, i, &m);
 
-			if (key < thin_end) {
+			if (m.thin_begin < thin_end) {
 				/* case d */
-				dm_block_t data_begin;
 				dm_block_t delta;
 
 				pr_alert("case d");
-				data_begin = le64_to_cpu(m->data_begin);
-				delta = thin_end - key;
-				r = dm_sm_dec_blocks(data_sm, data_begin, data_begin + delta);
+				delta = thin_end - m.thin_begin;
+				r = dm_sm_dec_blocks(data_sm, m.data_begin, m.data_begin + delta);
 				if (r)
 					return r;
-				m->data_begin += delta;
-				m->len = cpu_to_le32(len - delta);
-
-				n->keys[i] = thin_end;
+				truncate_front(n, i, m.len - delta);
 			}
 		}
 
@@ -2122,8 +2097,11 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 
 	/* adjust the node_end, which may have changed */
 	if (nr_entries) {
-		struct disk_mapping *m = n->values + nr_entries - 1;
-		n->header.node_end = cpu_to_le64(le64_to_cpu(n->keys[nr_entries - 1]) + le32_to_cpu(m->len));
+		struct disk_mapping *value_le = n->values + nr_entries - 1;
+		uint32_t len;
+		uint32_t time;
+		unpack_len_time(le32_to_cpu(value_le->len_time), &len, &time);
+		n->header.node_end = cpu_to_le64(le64_to_cpu(n->keys[nr_entries - 1]) + len);
 	}
 
 	return 0;
