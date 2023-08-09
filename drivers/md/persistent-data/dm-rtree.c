@@ -1325,6 +1325,8 @@ static void erase_from_leaf(struct leaf_node *node, unsigned index)
 static int action_to_left(struct dm_mapping *left, struct dm_mapping *right) {
 	int relation = test_relation(left, right);
 
+	//printk(KERN_DEBUG "TL left %llu right %llu, r=%x", left->thin_begin, right->thin_begin, relation);
+
 	// assume that right.len == 1, the relation falls into those categories,
 	// in which OVERLAPPED_PARTIAL is not possible:
 	switch (relation) {
@@ -1343,6 +1345,9 @@ static int action_to_left(struct dm_mapping *left, struct dm_mapping *right) {
 // FIXME: check for range length overflow
 static int action_to_right(struct dm_mapping *left, struct dm_mapping *right) {
 	int relation = test_relation(left, right);
+
+	//printk(KERN_DEBUG "TR left %llu right %llu, r=%x", left->thin_begin, right->thin_begin, relation);
+
 	// assume that left.len == 1, the relation falls into these categories,
 	// in which OVERLAPPED_PARTIAL is not possible:
 	switch (relation) {
@@ -1500,6 +1505,8 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 				break;
 		}
 	}
+
+	//printk(KERN_DEBUG "key = %llu, i = %d, v = %llu, action = %u", args->v->thin_begin, i, args->v->data_begin, action);
 
 	switch (action) {
 		case PUSH_BACK:
