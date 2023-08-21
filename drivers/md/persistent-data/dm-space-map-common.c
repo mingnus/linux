@@ -456,7 +456,7 @@ int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
 	int r;
 
 	for (; begin != end; begin++) {
-		r = sm_ll_find_free_block(new_ll, begin, new_ll->nr_blocks, b);
+		r = sm_ll_find_free_block(new_ll, begin, end, b);
 		if (r)
 			break;
 
