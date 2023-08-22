@@ -342,8 +342,10 @@ static int del_(struct del_args *args, dm_block_t loc)
 static void internal_erase(struct internal_node *n, unsigned index)
 {
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
-	array_erase(n->keys, sizeof(n->keys[0]), nr_entries, index);
-	array_erase(n->values, sizeof(n->values[0]), nr_entries, index);
+	if (index < nr_entries - 1) {
+		array_erase(n->keys, sizeof(n->keys[0]), nr_entries, index);
+		array_erase(n->values, sizeof(n->values[0]), nr_entries, index);
+	}
 	n->header.nr_entries = cpu_to_le32(nr_entries - 1);
 }
 
@@ -1322,8 +1324,10 @@ static int insert_into_leaf(struct insert_args *args, struct dm_block *b, unsign
 static void erase_from_leaf(struct leaf_node *node, unsigned index)
 {
 	uint32_t nr_entries = le32_to_cpu(node->header.nr_entries);
-	array_erase(node->keys, sizeof(node->keys[0]), nr_entries, index);
-	array_erase(node->values, sizeof(node->values[0]), nr_entries, index);
+	if (index < nr_entries - 1) {
+		array_erase(node->keys, sizeof(node->keys[0]), nr_entries, index);
+		array_erase(node->values, sizeof(node->values[0]), nr_entries, index);
+	}
 	node->header.nr_entries = cpu_to_le32(nr_entries - 1);
 }
 
@@ -1813,16 +1817,20 @@ static void erase_internal_entry(struct internal_node *n, unsigned index)
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
 	size_t upper = nr_entries - index - 1;
 	n->header.nr_entries = cpu_to_le32(nr_entries - 1);
-	memmove(n->keys + index, n->keys + index + 1, sizeof(n->keys[0]) * upper);
-	memmove(n->values + index, n->values + index + 1, sizeof(n->values[0]) * upper);
+	if (upper > 0) {
+		memmove(n->keys + index, n->keys + index + 1, sizeof(n->keys[0]) * upper);
+		memmove(n->values + index, n->values + index + 1, sizeof(n->values[0]) * upper);
+	}
 }
 
 static void erase_leaf_entries(struct leaf_node *n, unsigned index_b, unsigned index_e)
 {
 	size_t upper = le32_to_cpu(n->header.nr_entries) - index_e;
 	n->header.nr_entries = cpu_to_le32(index_b + upper);
-	memmove(n->keys + index_b, n->keys + index_e, sizeof(n->keys[0]) * upper);
-	memmove(n->values + index_b, n->values + index_e, sizeof(n->values[0]) * upper);
+	if (upper > 0) {
+		memmove(n->keys + index_b, n->keys + index_e, sizeof(n->keys[0]) * upper);
+		memmove(n->values + index_b, n->values + index_e, sizeof(n->values[0]) * upper);
+	}
 }
 
 /*
