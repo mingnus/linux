@@ -393,12 +393,13 @@ static void subtree_inc(void *context, const void *value, unsigned count)
 static void subtree_dec(void *context, const void *value, unsigned count)
 {
 	struct dm_btree_info *info = context;
+	struct dm_space_map *data_sm = info->value_type.context;
 	const __le64 *root_le = value;
 	unsigned i;
 
 	for (i = 0; i < count; i++, root_le++)
-		if (dm_btree_del(info, le64_to_cpu(*root_le)))
-			DMERR("btree delete failed");
+		if (dm_rtree_del(info->tm, data_sm, le64_to_cpu(*root_le)))
+			DMERR("rtree delete failed");
 }
 
 static int subtree_equal(void *context, const void *value1_le, const void *value2_le)
