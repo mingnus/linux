@@ -1875,8 +1875,10 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 
 			// FIXME: node_end is error prone, so I'm going to just recurse for now.
 			// FIXME: Do not recurse if key >= thin_end ?
-			remove_(tm, data_sm, child,
+			r = remove_(tm, data_sm, child,
                                 thin_begin, thin_end, res);
+			if (r)
+				return r;
 
 			/* Remove or update the child pointer */
 			if (res->nodes[0].nr_entries == 0) {
@@ -1913,8 +1915,10 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 				child = le64_to_cpu(n->values[i]);
 
 				/* There's an overlap, recurse into the child */
-				remove_(tm, data_sm, child,
+				r = remove_(tm, data_sm, child,
 	                                thin_begin, thin_end, res);
+				if (r)
+					return r;
 
 				/* Remove or update the child pointer */
 				if (res->nodes[0].nr_entries == 0) {
