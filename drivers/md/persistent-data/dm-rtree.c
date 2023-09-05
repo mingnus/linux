@@ -1387,21 +1387,23 @@ static void truncate_front(struct leaf_node *n, int i, uint32_t len) {
 	value_le->len_time = cpu_to_le32(pack_len_time(len, m.time));
 }
 
-// FIXME: similar to the case (e) in remove_leaf_()
-// TODO: dec ref counts
+// Similar to the case (e) in remove_leaf_()
 static int remove_middle_(struct dm_transaction_manager *tm, struct dm_space_map *data_sm, struct dm_block *b, int i, uint64_t thin_begin, uint64_t thin_end, struct insert_result *res)
 {
 	struct dm_mapping m;
 	struct dm_mapping back_half;
 	struct insert_args i_args;
 	struct leaf_node *n;
+	uint64_t front_half_len;
 	uint64_t padding;
+	int r;
 
 	n = dm_block_data(b);
 	get_mapping(n, i, &m);
 
 	/* truncate the front half */
-	set_len(n, i, thin_begin - m.thin_begin);
+	front_half_len = thin_begin - m.thin_begin;
+	set_len(n, i, front_half_len);
 
 	/* insert new back half entry */
 	padding = thin_end - m.thin_begin;
@@ -1415,7 +1417,11 @@ static int remove_middle_(struct dm_transaction_manager *tm, struct dm_space_map
 	i_args.data_sm = data_sm;
 	i_args.v = &back_half;
 
-	return insert_into_leaf(&i_args, b, i + 1, res);
+	r = insert_into_leaf(&i_args, b, i + 1, res);
+	if (r)
+		return r;
+
+	return dm_sm_dec_blocks(data_sm, m.data_begin + front_half_len, back_half.data_begin);
 }
 
 static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i, struct insert_result *res)
@@ -2054,7 +2060,6 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 
 	if (m.thin_begin < thin_begin && (m.thin_begin + m.len) > thin_end) {
 		/* case e */
-		// FIXME: dec ref counts of removed blocks
 		struct insert_result insert_res;
 		remove_middle_(tm, data_sm, block, i, thin_begin, thin_end, &insert_res);
 		res->nr_nodes = insert_res.nr_nodes;
