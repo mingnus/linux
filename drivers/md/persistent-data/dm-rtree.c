@@ -321,19 +321,31 @@ static int del_(struct del_args *args, dm_block_t loc)
 	int r;
 	struct node_ops *ops;
 	struct dm_block *b;
+	int shared;
+
+	r = dm_tm_block_is_shared(args->tm, loc, &shared);
+	if (r)
+		return r;
+
+	if (shared) {
+		/* just decrement the ref count for this block */
+		dm_tm_dec(args->tm, loc);
+		return 0;
+	}
 
 	r = dm_tm_read_lock(args->tm, loc, &validator, &b);
 	if (r)
 		return r;
 
 	r = get_ops(dm_block_data(b), &ops);
-	if (r) {
-		dm_tm_unlock(args->tm, b);
-		return r;
-	}
+	if (!r)
+		r = ops->del(args, b);
 
-	r = ops->del(args, b);
 	dm_tm_unlock(args->tm, b);
+
+	if (!r)
+		dm_tm_dec(args->tm, loc); // FIXME: return errors form dm_tm_dec()?
+
 	return r;
 }
 
@@ -494,10 +506,14 @@ static void internal_rebalance3(struct dm_transaction_manager *tm,
 
 static int internal_del(struct del_args *args, struct dm_block *b)
 {
+	struct internal_node *n;
+	struct dm_block_manager *bm;
+	uint32_t i, nr_entries;
 	int r;
-	struct internal_node *n = dm_block_data(b);
-	struct dm_block_manager *bm = dm_tm_get_bm(args->tm);
-	uint32_t i, nr_entries = le32_to_cpu(n->header.nr_entries);
+
+	n = dm_block_data(b);
+	nr_entries = le32_to_cpu(n->header.nr_entries);
+	bm = dm_tm_get_bm(args->tm);
 
 	/* prefetch children */
 	for (i = 0; i < nr_entries; i++)
@@ -505,24 +521,12 @@ static int internal_del(struct del_args *args, struct dm_block *b)
 
 	/* recurse into children */
 	for (i = 0; i < nr_entries; i++) {
-		int shared;
 		dm_block_t child_b = le64_to_cpu(n->values[i]);
-
-		r = dm_tm_block_is_shared(args->tm, child_b, &shared);
+		r = del_(args, child_b);
 		if (r)
 			return r;
-
-		if (shared) {
-			/* just decrement the ref count for this child */
-			dm_tm_dec(args->tm, child_b);
-		} else {
-			r = del_(args, child_b);
-			if (r)
-				return r;
-		}
 	}
 
-	dm_tm_dec(args->tm, dm_block_location(b));
 	return 0;
 }
 
@@ -1161,8 +1165,12 @@ static void leaf_rebalance3(struct dm_transaction_manager *tm,
 
 static int leaf_del(struct del_args *args, struct dm_block *b)
 {
-	struct leaf_node *n = dm_block_data(b);
-	uint32_t i, nr_entries = le32_to_cpu(n->header.nr_entries);
+	struct leaf_node *n;
+	uint32_t i, nr_entries;
+	int r;
+
+	n = dm_block_data(b);
+	nr_entries = le32_to_cpu(n->header.nr_entries);
 
 	/* release the data blocks */
 	for (i = 0; i < nr_entries; i++) {
@@ -1175,10 +1183,11 @@ static int leaf_del(struct del_args *args, struct dm_block *b)
 		unpack_len_time(value_le->len_time, &len, &time);
 		data_begin = le64_to_cpu(value_le->data_begin);
 		data_end = data_begin + len;
-		dm_sm_dec_blocks(args->data_sm, data_begin, data_end);
+		r = dm_sm_dec_blocks(args->data_sm, data_begin, data_end);
+		if (r)
+			return r;
 	}
 
-	dm_tm_dec(args->tm, dm_block_location(b));
 	return 0;
 }
 
