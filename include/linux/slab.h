@@ -572,6 +572,7 @@ void *kmalloc_large_node(size_t size, gfp_t flags, int node) __assume_page_align
  */
 static __always_inline __alloc_size(1) void *kmalloc(size_t size, gfp_t flags)
 {
+#if 0
 	if (__builtin_constant_p(size) && size) {
 		unsigned int index;
 
@@ -583,6 +584,7 @@ static __always_inline __alloc_size(1) void *kmalloc(size_t size, gfp_t flags)
 				kmalloc_caches[kmalloc_type(flags)][index],
 				flags, size);
 	}
+#endif
 	return __kmalloc(size, flags);
 }
 
