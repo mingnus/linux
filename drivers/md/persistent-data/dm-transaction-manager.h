@@ -151,4 +151,7 @@ int dm_tm_open_with_sm(struct dm_block_manager *bm, dm_block_t sb_location,
 		       struct dm_transaction_manager **tm,
 		       struct dm_space_map **sm);
 
+void dm_tm_update_stats(struct dm_transaction_manager *tm, int *action, int *stats);
+void dm_tm_load_stats(struct dm_transaction_manager *tm, int *action, int *stats);
+
 #endif	/* _LINUX_DM_TRANSACTION_MANAGER_H */

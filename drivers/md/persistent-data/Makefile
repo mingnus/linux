@@ -11,4 +11,5 @@ dm-persistent-data-objs := \
 	dm-transaction-manager.o \
 	dm-btree.o \
 	dm-btree-remove.o \
-	dm-btree-spine.o
+	dm-btree-spine.o \
+	dm-rtree.o

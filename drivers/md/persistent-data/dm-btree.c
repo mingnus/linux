@@ -1223,6 +1223,7 @@ int btree_get_overwrite_leaf(struct dm_btree_info *info, dm_block_t root,
 
 	return r;
 }
+EXPORT_SYMBOL_GPL(btree_get_overwrite_leaf);
 
 static bool need_insert(struct btree_node *node, uint64_t *keys,
 			unsigned int level, unsigned int index)

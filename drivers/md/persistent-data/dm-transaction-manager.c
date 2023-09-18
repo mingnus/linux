@@ -98,6 +98,10 @@ struct dm_transaction_manager {
 	struct hlist_head buckets[DM_HASH_SIZE];
 
 	struct prefetch_set prefetches;
+
+	// perf counters
+	unsigned action[8];
+	unsigned stats[8];
 };
 
 /*----------------------------------------------------------------*/
@@ -231,6 +235,9 @@ int dm_tm_commit(struct dm_transaction_manager *tm, struct dm_block *root)
 
 	wipe_shadow_table(tm);
 	dm_bm_unlock(root);
+
+	memset(tm->action, 0, sizeof(tm->action));
+	memset(tm->stats, 0, sizeof(tm->stats));
 
 	return dm_bm_flush(tm->bm);
 }
@@ -517,5 +524,21 @@ int dm_tm_open_with_sm(struct dm_block_manager *bm, dm_block_t sb_location,
 	return dm_tm_create_internal(bm, sb_location, tm, sm, 0, sm_root, root_len);
 }
 EXPORT_SYMBOL_GPL(dm_tm_open_with_sm);
+
+void dm_tm_update_stats(struct dm_transaction_manager *tm, int *action, int *stats) {
+	int i;
+	for (i = 0; i < 8; i++)
+		tm->action[i] += action[i];
+	for (i = 0; i < 8; i++)
+		tm->stats[i] += stats[i];
+}
+
+void dm_tm_load_stats(struct dm_transaction_manager *tm, int *action, int *stats) {
+	int i;
+	for (i = 0; i < 8; i++)
+		action[i] = tm->action[i];
+	for (i = 0; i < 8; i++)
+		stats[i] = tm->stats[i];
+}
 
 /*----------------------------------------------------------------*/

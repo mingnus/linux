@@ -7,7 +7,9 @@
 
 #include "dm-thin-metadata.h"
 #include "persistent-data/dm-btree.h"
+#include "persistent-data/dm-btree-internal.h"
 #include "persistent-data/dm-extent-allocator.h"
+#include "persistent-data/dm-rtree.h"
 #include "persistent-data/dm-space-map.h"
 #include "persistent-data/dm-space-map-disk.h"
 #include "persistent-data/dm-transaction-manager.h"
@@ -395,12 +397,13 @@ static void subtree_inc(void *context, const void *value, unsigned int count)
 static void subtree_dec(void *context, const void *value, unsigned int count)
 {
 	struct dm_btree_info *info = context;
+	struct dm_space_map *data_sm = info->value_type.context;
 	const __le64 *root_le = value;
-	unsigned int i;
+	unsigned i;
 
 	for (i = 0; i < count; i++, root_le++)
-		if (dm_btree_del(info, le64_to_cpu(*root_le)))
-			DMERR("btree delete failed");
+		if (dm_rtree_del(info->tm, data_sm, le64_to_cpu(*root_le)))
+			DMERR("rtree delete failed");
 }
 
 static int subtree_equal(void *context, const void *value1_le, const void *value2_le)
@@ -1055,6 +1058,9 @@ int dm_pool_metadata_close(struct dm_pool_metadata *pmd)
 	if (pmd->data_extents)
 		dm_extent_allocator_destroy(pmd->data_extents);
 
+	if (pmd->data_extents)
+		dm_extent_allocator_destroy(pmd->data_extents);
+
 	kfree(pmd);
 	return 0;
 }
@@ -1150,7 +1156,7 @@ static int __create_thin(struct dm_pool_metadata *pmd,
 	/*
 	 * Create an empty btree for the mappings.
 	 */
-	r = dm_btree_empty(&pmd->bl_info, &dev_root);
+	r = dm_rtree_empty(pmd->tm, &dev_root);
 	if (r)
 		return r;
 
@@ -1161,14 +1167,14 @@ static int __create_thin(struct dm_pool_metadata *pmd,
 	__dm_bless_for_disk(&value);
 	r = dm_btree_insert(&pmd->tl_info, pmd->root, &key, &value, &pmd->root);
 	if (r) {
-		dm_btree_del(&pmd->bl_info, dev_root);
+		dm_rtree_del(pmd->tm, pmd->data_sm, dev_root);
 		return r;
 	}
 
 	r = __open_device(pmd, dev, 1, &td);
 	if (r) {
 		dm_btree_remove(&pmd->tl_info, pmd->root, &key, &pmd->root);
-		dm_btree_del(&pmd->bl_info, dev_root);
+		dm_rtree_del(pmd->tm, pmd->data_sm, dev_root);
 		return r;
 	}
 	__close_device(td);
@@ -1383,7 +1389,7 @@ static int __reserve_metadata_snap(struct dm_pool_metadata *pmd)
 	/*
 	 * Copy the superblock.
 	 */
-	dm_sm_inc_block(pmd->metadata_sm, THIN_SUPERBLOCK_LOCATION);
+	dm_sm_inc_blocks(pmd->metadata_sm, THIN_SUPERBLOCK_LOCATION, THIN_SUPERBLOCK_LOCATION + 1);
 	r = dm_tm_shadow_block(pmd->tm, THIN_SUPERBLOCK_LOCATION,
 			       &sb_validator, &copy, &inc);
 	if (r)
@@ -1473,7 +1479,7 @@ static int __release_metadata_snap(struct dm_pool_metadata *pmd)
 	disk_super = dm_block_data(copy);
 	dm_btree_del(&pmd->info, le64_to_cpu(disk_super->data_mapping_root));
 	dm_btree_del(&pmd->details_info, le64_to_cpu(disk_super->device_details_root));
-	dm_sm_dec_block(pmd->metadata_sm, held_root);
+	dm_sm_dec_blocks(pmd->metadata_sm, held_root, held_root + 1);
 
 	dm_tm_unlock(pmd->tm, copy);
 
@@ -1699,21 +1705,56 @@ static int __insert(struct dm_thin_device *td, dm_block_t block,
 		    dm_block_t data_block)
 {
 	int r, inserted;
-	__le64 value;
+	__le64 *v_ptr;
 	struct dm_pool_metadata *pmd = td->pmd;
-	dm_block_t keys[2] = { td->id, block };
+	struct dm_mapping mapping;
+	dm_block_t tl_root;
+	dm_block_t mapping_root;
+	struct dm_block *tl_leaf;
+	struct btree_node *node;
+	int index;
 
-	value = cpu_to_le64(pack_block_time(data_block, pmd->time));
-	__dm_bless_for_disk(&value);
-
-	r = dm_btree_insert_notify(&pmd->info, pmd->root, keys, &value,
-				   &pmd->root, &inserted);
+	/* Find the mapping tree */
+	r = btree_get_overwrite_leaf(&pmd->tl_info, pmd->root, td->id, &index, &tl_root, &tl_leaf);
 	if (r)
 		return r;
 
+	node = dm_block_data(tl_leaf);
+
+	// unlikely
+	if (index < 0 || index >= le32_to_cpu(node->header.nr_entries)) {
+	    dm_tm_unlock(pmd->tm, tl_leaf);
+	    return -EINVAL;
+	}
+
+	v_ptr = value_ptr(node, index);
+	__dm_reads_from_disk(v_ptr);
+	mapping_root = le64_to_cpu(*v_ptr);
+
+	/* Insert into the range-tree */
+	mapping.thin_begin = block;
+	mapping.data_begin = data_block;
+	mapping.len = 1;
+	mapping.time = pmd->time;
+	inserted = 0; // TODO: stub
+	r = dm_rtree_insert(pmd->tm, pmd->data_sm, mapping_root, &mapping, &mapping_root, &inserted);
+	if (r) {
+		dm_tm_unlock(pmd->tm, tl_leaf);
+		return r;
+	}
+
 	td->changed = true;
-	if (inserted)
+
+	if (inserted == 1) {
 		td->mapped_blocks++;
+	}
+
+	/* Reinsert the mapping tree */
+	*v_ptr = cpu_to_le64(mapping_root);
+	__dm_written_to_disk(v_ptr);
+	dm_tm_unlock(pmd->tm, tl_leaf);
+
+	pmd->root = tl_root;
 
 	return 0;
 }
@@ -1761,25 +1802,14 @@ static int __remove_range(struct dm_thin_device *td, dm_block_t begin, dm_block_
 	 * Remove leaves stops at the first unmapped entry, so we have to
 	 * loop round finding mapped ranges.
 	 */
-	while (begin < end) {
-		r = dm_btree_lookup_next(&pmd->bl_info, mapping_root, &begin, &begin, &value);
-		if (r == -ENODATA)
-			break;
-
-		if (r)
-			return r;
-
-		if (begin >= end)
-			break;
-
-		r = dm_btree_remove_leaves(&pmd->bl_info, mapping_root, &begin, end, &mapping_root, &count);
-		if (r)
-			return r;
-
-		total_count += count;
+	r = dm_rtree_remove(pmd->tm, pmd->data_sm, mapping_root, begin, end, &mapping_root);
+	if (r) {
+		dm_tm_dec(pmd->tm, mapping_root);
+		return r;
 	}
 
-	td->mapped_blocks -= total_count;
+	// FIXME: return the number of removed keys from rtree_remove
+	td->mapped_blocks -= (end - begin);
 	td->changed = true;
 
 	/*
@@ -2044,9 +2074,12 @@ int dm_thin_get_mapped_count(struct dm_thin_device *td, dm_block_t *result)
 	return r;
 }
 
+// FIXME: finish
 static int __highest_block(struct dm_thin_device *td, dm_block_t *result)
 {
-	int r;
+	*result = 0;
+	return 0;
+	/*int r;
 	__le64 value_le;
 	dm_block_t thin_root;
 	struct dm_pool_metadata *pmd = td->pmd;
@@ -2057,7 +2090,7 @@ static int __highest_block(struct dm_thin_device *td, dm_block_t *result)
 
 	thin_root = le64_to_cpu(value_le);
 
-	return dm_btree_find_highest_key(&pmd->bl_info, thin_root, result);
+	return dm_btree_find_highest_key(&pmd->bl_info, thin_root, result);*/
 }
 
 int dm_thin_get_highest_mapped_block(struct dm_thin_device *td,
