@@ -17,6 +17,7 @@
 // - We could add a timestamp that is updated every time the block is written (by the validator).
 //   This would be helpful for repairing damaged metadata.
 // - do we need node_end?
+// - I'm not sure shift needs to be an op
 
 /*----------------------------------------------------------------*/
 
@@ -165,6 +166,9 @@ struct node_ops {
 	 * Shifting may cause entries to be merged, so don't assume you know
 	 * the nr_entries after a shift.
 	 */
+	void (*shift)(struct dm_block *left, struct dm_block *right,
+		      int count);
+
 	void (*rebalance2)(struct dm_transaction_manager * tm,
 			   struct dm_block * left, struct dm_block * right,
 			   struct rebalance_result * res);
@@ -505,7 +509,7 @@ static void internal_shift(struct dm_block *left, struct dm_block *right,
 	r->header.nr_entries = cpu_to_le32(nr_right + count);
 }
 
-static void redist2_internal(struct dm_block *left_, struct dm_block *right_);
+static void internal_redist2(struct dm_block *left_, struct dm_block *right_);
 static void internal_rebalance2(struct dm_transaction_manager *tm,
 				struct dm_block *left, struct dm_block *right,
 				struct rebalance_result *res)
@@ -526,7 +530,7 @@ static void internal_rebalance2(struct dm_transaction_manager *tm,
 			       le32_to_cpu(l->header.nr_entries));
 
 	} else {
-		redist2_internal(left, right);
+		internal_redist2(left, right);
 		res->nr_nodes = 2;
 		init_node_info(&res->nodes[0], dm_block_location(left),
 			       le64_to_cpu(l->keys[0]),
@@ -563,10 +567,10 @@ static void internal_delete_center_node(struct dm_transaction_manager *tm,
 	}
 
 	dm_tm_dec(tm, dm_block_location(center));
-	redist2_internal(left, right);
+	internal_redist2(left, right);
 }
 
-static void redist3_internal(struct dm_block *left_, struct dm_block *center_,
+static void internal_redist3(struct dm_block *left_, struct dm_block *center_,
 			     struct dm_block *right_);
 static void internal_rebalance3(struct dm_transaction_manager *tm,
 				struct dm_block *left, struct dm_block *center,
@@ -594,7 +598,7 @@ static void internal_rebalance3(struct dm_transaction_manager *tm,
 			       le32_to_cpu(r->header.nr_entries));
 
 	} else {
-		redist3_internal(left, center, right);
+		internal_redist3(left, center, right);
 		res->nr_nodes = 3;
 		init_node_info(&res->nodes[0], dm_block_location(left),
 			       le64_to_cpu(l->keys[0]),
@@ -648,7 +652,7 @@ static void insert_into_internal(struct internal_node *node, unsigned index,
 	node->header.nr_entries = cpu_to_le32(nr_entries + 1);
 }
 
-static void redist2_internal(struct dm_block *left_, struct dm_block *right_)
+static void internal_redist2(struct dm_block *left_, struct dm_block *right_)
 {
 	struct internal_node *left = dm_block_data(left_);
 	struct internal_node *right = dm_block_data(right_);
@@ -668,7 +672,7 @@ static void redist2_internal(struct dm_block *left_, struct dm_block *right_)
 	}
 }
 
-static void redist3_internal(struct dm_block *left_, struct dm_block *center_,
+static void internal_redist3(struct dm_block *left_, struct dm_block *center_,
 			     struct dm_block *right_)
 {
 	struct internal_node *left = dm_block_data(left_);
@@ -977,7 +981,7 @@ static int internal_insert(struct insert_args *args, struct dm_block *b,
 
 			// TODO: try rebalancing with the sibling whilst insertion
 			// (i.e., split_two_into_three)
-			redist2_internal(b, sib);
+			internal_redist2(b, sib);
 
 			if (args->v->thin_begin < le64_to_cpu(sib_n->keys[0]))
 				n2 = n;
@@ -1013,6 +1017,7 @@ static int internal_remove(struct remove_args *args, struct dm_block *b)
 }
 
 static struct node_ops internal_ops = {
+	.shift = internal_shift,
 	.rebalance2 = internal_rebalance2,
 	.rebalance3 = internal_rebalance3,
 	.del = internal_del,
@@ -1729,6 +1734,7 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 }
 
 static struct node_ops leaf_ops = {
+	.shift = leaf_shift,
 	.rebalance2 = leaf_rebalance2,
 	.rebalance3 = leaf_rebalance3,
 	.del = leaf_del,
@@ -1840,31 +1846,6 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 EXPORT_SYMBOL_GPL(dm_rtree_lookup);
 
 /*----------------------------------------------------------------*/
-
-#if 0
-/*
- * We often need to modify a sibling node.  This function shadows a particular
- * child of the given parent node.  Making sure to update the parent to point
- * to the new shadow.
- */
-static int shadow_child(struct dm_transaction_manager *tm,
-			struct dm_space_map *data_sm,
-			struct internal_node *pn,
-			unsigned index, struct dm_block **result)
-{
-	int r, inc;
-	dm_block_t block = le64_to_cpu(pn->values[index]);
-	r = dm_tm_shadow_block(tm, block, &validator, result, &inc);
-	if (r)
-		return r;
-
-	if (inc)
-		inc_children(tm, data_sm, *result);
-
-	pn->values[index] = cpu_to_le64(dm_block_location(*result));
-	return 0;
-}
-#endif
 
 /*
  * Returns the number of spare entries in a node.
@@ -2136,7 +2117,7 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 			sib_n->header.flags = n->header.flags;
 			sib_n->header.nr_entries = cpu_to_le32(0);
 
-			redist2_internal(block, sib);
+			internal_redist2(block, sib);
 
 			if (new_node->lowest_key < le64_to_cpu(sib_n->keys[0]))
 				n2 = n;
