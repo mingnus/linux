@@ -9,16 +9,22 @@
 
 #include <linux/device-mapper.h>
 
-#define DM_MSG_PREFIX "btree"
+#define DM_MSG_PREFIX "rtree"
 
 /*----------------------------------------------------------------*/
 
+// TODO:
+// - We could add a timestamp that is updated every time the block is written (by the validator).
+//   This would be helpful for repairing damaged metadata.
+//
+
+
+/*----------------------------------------------------------------*/
 enum node_flags {
 	INTERNAL_NODE = 1,
 	LEAF_NODE = 1 << 1
 };
 
-// FIXME: add timestamp
 struct node_header {
 	__le32 csum;
 	__le32 flags;
@@ -263,7 +269,8 @@ static void set_len(struct leaf_node *n, int i, uint32_t len) {
 
 /*----------------------------------------------------------------*/
 
-static void init_node_info(struct node_info *info, dm_block_t loc, dm_block_t lowest_key, unsigned nr_entries)
+static void init_node_info(struct node_info *info, dm_block_t loc, dm_block_t lowest_key,
+			   unsigned nr_entries)
 {
 	info->loc = loc;
 	info->lowest_key = lowest_key;
@@ -1505,38 +1512,38 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 	} else {
 		action = action_to_left(&center, value);
 		switch (action) {
-			case REPLACE:
-				if (i > 0 && action_to_left(&left, value) == PUSH_BACK) {
-					if (i + 1 < nr_entries &&
-					    action_to_right(value, &right) == PUSH_FRONT &&
-					    left.len + right.len < MAPPINGS_MAX_LEN)
-						action = MERGE_REPLACED;
-					else
-						// prefers PUSH_BACK_REPLACED rather than
-						// PUSH_FRONT_REPLACED if the merged length overflows
-						action = PUSH_BACK_REPLACED;
-				} else if (i + 1 < nr_entries &&
-					   action_to_right(value, &right) == PUSH_FRONT)
-					action = PUSH_FRONT_REPLACED;
-				break;
-			case TRUNCATE_FRONT:
-				if (i > 0 && action_to_left(&left, value) == PUSH_BACK)
-					action = PUSH_BACK_TRUNCATED;
-				break;
-			case TRUNCATE_BACK:
-				if (i + 1 < nr_entries && action_to_right(value, &right) == PUSH_FRONT)
-					action = PUSH_FRONT_TRUNCATED;
-				break;
-			case PUSH_BACK:
+		case REPLACE:
+			if (i > 0 && action_to_left(&left, value) == PUSH_BACK) {
 				if (i + 1 < nr_entries &&
-				    action_to_right(value, &right) == PUSH_FRONT &&
-				    center.len + right.len < MAPPINGS_MAX_LEN)
-					action = MERGE;
-				break;
-			case INSERT_NEW:
-				if (i + 1 < nr_entries)
-					action = action_to_right(value, &right);
-				break;
+					action_to_right(value, &right) == PUSH_FRONT &&
+					left.len + right.len < MAPPINGS_MAX_LEN)
+					action = MERGE_REPLACED;
+				else
+					// prefers PUSH_BACK_REPLACED rather than
+					// PUSH_FRONT_REPLACED if the merged length overflows
+					action = PUSH_BACK_REPLACED;
+			} else if (i + 1 < nr_entries &&
+					action_to_right(value, &right) == PUSH_FRONT)
+				action = PUSH_FRONT_REPLACED;
+			break;
+		case TRUNCATE_FRONT:
+			if (i > 0 && action_to_left(&left, value) == PUSH_BACK)
+				action = PUSH_BACK_TRUNCATED;
+			break;
+		case TRUNCATE_BACK:
+			if (i + 1 < nr_entries && action_to_right(value, &right) == PUSH_FRONT)
+				action = PUSH_FRONT_TRUNCATED;
+			break;
+		case PUSH_BACK:
+			if (i + 1 < nr_entries &&
+				action_to_right(value, &right) == PUSH_FRONT &&
+				center.len + right.len < MAPPINGS_MAX_LEN)
+				action = MERGE;
+			break;
+		case INSERT_NEW:
+			if (i + 1 < nr_entries)
+				action = action_to_right(value, &right);
+			break;
 		}
 	}
 
