@@ -16,10 +16,11 @@
 // TODO:
 // - We could add a timestamp that is updated every time the block is written (by the validator).
 //   This would be helpful for repairing damaged metadata.
-//
-
+// - do we need node_end?
+// - I'm not sure shift needs to be an op
 
 /*----------------------------------------------------------------*/
+
 enum node_flags {
 	INTERNAL_NODE = 1,
 	LEAF_NODE = 1 << 1
@@ -30,15 +31,12 @@ struct node_header {
 	__le32 flags;
 	__le64 blocknr;
 
-
-	// FIXME: do we need this?
 	/* this is the end value for the highest range in this subtree */
 	__le64 node_end;
 
 	__le32 nr_entries;
 	__le32 padding;
 
-	// FIXME: add data_base
 } __attribute__((packed, aligned(8)));
 
 // FIXME: if we shrink data_begin to 32bits, then we'll have to aligned(4)
@@ -168,7 +166,6 @@ struct node_ops {
          * Shifting may cause entries to be merged, so don't assume you know
          * the nr_entries after a shift.
          */
-        // FIXME: I'm not sure shift needs to be an op
 	void (*shift)(struct dm_block *left, struct dm_block *right, int count);
 
 	void (*rebalance2)(struct dm_transaction_manager *tm,
@@ -2130,7 +2127,6 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 				/* case d */
 				dm_block_t delta;
 
-				pr_alert("case d");
 				delta = thin_end - m.thin_begin;
 				r = dm_sm_dec_blocks(data_sm, m.data_begin, m.data_begin + delta);
 				if (r)
