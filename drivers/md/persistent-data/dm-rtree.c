@@ -357,6 +357,79 @@ static int del_(struct del_args *args, dm_block_t loc)
 
 /*----------------------------------------------------------------*/
 
+/**
+ * inc_children - Increment the reference count of all children of an rtree
+ * node.
+ *
+ * @tm: The transaction manager to use.
+ * @data_sm: The data space map to use.
+ * @b: The block containing the node to increment the children of.
+ *
+ * Returns:
+ *  - 0 on success
+ *  - -EINVAL if the node is not an internal or leaf node
+ */
+static int inc_children(struct dm_transaction_manager *tm,
+			struct dm_space_map *data_sm, struct dm_block *b)
+{
+	struct node_header *h = dm_block_data(b);
+	uint32_t flags = le32_to_cpu(h->flags);
+	uint32_t nr_entries = le32_to_cpu(h->nr_entries);
+
+	if (flags == INTERNAL_NODE) {
+		struct internal_node *n = (struct internal_node *)h;
+		dm_tm_with_runs(tm, n->values, nr_entries, dm_tm_inc_range);
+
+	} else if (flags == LEAF_NODE) {
+		struct leaf_node *n = (struct leaf_node *)h;
+		int i;
+		for (i = 0; i < nr_entries;
+		     i++) { // FIXME: loop through the value ptr
+			struct dm_mapping m;
+			dm_block_t data_end;
+			get_mapping(n, i, &m);
+			data_end = m.data_begin + m.len;
+			dm_sm_inc_blocks(data_sm, m.data_begin, data_end);
+		}
+	} else {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * shadow_node - Shadow a node and increment any children.
+ *
+ * @tm: The transaction manager to use.
+ * @data_sm: The data space map to use.
+ * @loc: The location of the block to shadow.
+ * @result: Pointer to a variable that will be set to the shadow block.
+ */
+static int shadow_node(struct dm_transaction_manager *tm,
+			   struct dm_space_map *data_sm, dm_block_t loc,
+			   struct dm_block **result)
+{
+	int inc, r;
+
+	r = dm_tm_shadow_block(tm, loc, &validator, result, &inc);
+	if (r)
+		return r;
+
+	if (inc) {
+		r = inc_children(tm, data_sm, *result);
+		if (r) {
+			dm_tm_unlock(tm, *result);
+			dm_tm_dec(tm, dm_block_location(*result));
+			return r;
+		}
+	}
+
+	return 0;
+}
+
+/*----------------------------------------------------------------*/
+
 static void internal_erase(struct internal_node *n, unsigned index)
 {
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
@@ -639,48 +712,6 @@ static void redist3_internal(struct dm_block *left_, struct dm_block *center_,
 	}
 }
 
-static int inc_children(struct dm_transaction_manager *tm,
-			struct dm_space_map *data_sm, struct dm_block *b)
-{
-	struct node_header *h = dm_block_data(b);
-	uint32_t flags = le32_to_cpu(h->flags);
-	uint32_t nr_entries = le32_to_cpu(h->nr_entries);
-
-	if (flags == INTERNAL_NODE) {
-		struct internal_node *n = (struct internal_node *)h;
-		dm_tm_with_runs(tm, n->values, nr_entries, dm_tm_inc_range);
-	} else if (flags == LEAF_NODE) {
-		struct leaf_node *n = (struct leaf_node *)h;
-		int i;
-		for (i = 0; i < nr_entries; i++) {	// FIXME: loop through the value ptr
-			struct dm_mapping m;
-			dm_block_t data_end;
-			get_mapping(n, i, &m);
-			data_end = m.data_begin + m.len;
-			dm_sm_inc_blocks(data_sm, m.data_begin, data_end);
-		}
-	} else {
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int shadow_node(struct dm_transaction_manager *tm,
-		       struct dm_space_map *data_sm, dm_block_t loc,
-		       struct dm_block **result)
-{
-	int inc, r;
-
-	r = dm_tm_shadow_block(tm, loc, &validator, result, &inc);
-	if (r)
-		return r;
-
-	if (inc)
-		inc_children(tm, data_sm, *result);
-
-	return 0;
-}
 
 // FIXME: rename
 static int insert_aux(struct insert_args *args, dm_block_t loc,
