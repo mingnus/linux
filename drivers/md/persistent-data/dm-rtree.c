@@ -17,7 +17,6 @@
 // - We could add a timestamp that is updated every time the block is written (by the validator).
 //   This would be helpful for repairing damaged metadata.
 // - do we need node_end?
-// - I'm not sure shift needs to be an op
 
 /*----------------------------------------------------------------*/
 
@@ -166,8 +165,6 @@ struct node_ops {
          * Shifting may cause entries to be merged, so don't assume you know
          * the nr_entries after a shift.
          */
-	void (*shift)(struct dm_block *left, struct dm_block *right, int count);
-
 	void (*rebalance2)(struct dm_transaction_manager *tm,
                            struct dm_block *left, struct dm_block *right,
                            struct rebalance_result *res);
@@ -935,7 +932,6 @@ static int internal_remove(struct remove_args *args, struct dm_block *b)
 }
 
 static struct node_ops internal_ops = {
-	.shift = internal_shift,
 	.rebalance2 = internal_rebalance2,
 	.rebalance3 = internal_rebalance3,
 	.del = internal_del,
@@ -1603,7 +1599,6 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 }
 
 static struct node_ops leaf_ops = {
-	.shift = leaf_shift,
 	.rebalance2 = leaf_rebalance2,
 	.rebalance3 = leaf_rebalance3,
 	.del = leaf_del,
