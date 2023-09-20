@@ -105,25 +105,25 @@ enum range_relation {
 };
 
 enum value_compatibility {
-	INCOMPATIBLE = 0x100, // FIXME: do we really need an incompatible flag?
-	COMPATIBLE   = 0x200,
+	INCOMPATIBLE = 0x100,	// FIXME: do we really need an incompatible flag?
+	COMPATIBLE = 0x200,
 };
 
 enum leaf_insert_actions {
 	NOOP = 0,
-	PUSH_BACK,	// LEFT | ADJACENTED | COMPATIBLE,
+	PUSH_BACK,		// LEFT | ADJACENTED | COMPATIBLE,
 	PUSH_BACK_REPLACED,
 	PUSH_BACK_TRUNCATED,
-	PUSH_FRONT,	//  RIGHT | ADJACENTED | COMPATIBLE,
+	PUSH_FRONT,		//  RIGHT | ADJACENTED | COMPATIBLE,
 	PUSH_FRONT_REPLACED,
 	PUSH_FRONT_TRUNCATED,
-	MERGE,		// LEFT | RIGHT | ADJACENTED | COMPATIBLE,
+	MERGE,			// LEFT | RIGHT | ADJACENTED | COMPATIBLE,
 	MERGE_REPLACED,
-	TRUNCATE_BACK,	// LEFT | OVERLAPPED_TAIL | INCOMPATIBLE,
-	TRUNCATE_FRONT,	// LEFT | OVERLAPPED_HEAD | INCOMPATIBLE,
-	REPLACE,	// LEFT | OVERLAP_ALL | INCOMPATIBLE
-	INSERT_NEW,	// ADJACENTED-INCOMPATIBLE, DISJOINT-*
-	SPLIT,		// LEFT | OVERLAPPED_CENTER | INCOMPATIBLE,
+	TRUNCATE_BACK,		// LEFT | OVERLAPPED_TAIL | INCOMPATIBLE,
+	TRUNCATE_FRONT,		// LEFT | OVERLAPPED_HEAD | INCOMPATIBLE,
+	REPLACE,		// LEFT | OVERLAP_ALL | INCOMPATIBLE
+	INSERT_NEW,		// ADJACENTED-INCOMPATIBLE, DISJOINT-*
+	SPLIT,			// LEFT | OVERLAPPED_CENTER | INCOMPATIBLE,
 };
 
 struct remove_args {
@@ -162,22 +162,25 @@ enum rebalance_res {
 
 struct node_ops {
 	/*
-         * Shifting may cause entries to be merged, so don't assume you know
-         * the nr_entries after a shift.
-         */
-	void (*rebalance2)(struct dm_transaction_manager *tm,
-                           struct dm_block *left, struct dm_block *right,
-                           struct rebalance_result *res);
-	void (*rebalance3)(struct dm_transaction_manager *tm,
-                           struct dm_block *left, struct dm_block *center, struct dm_block *right,
-                           struct rebalance_result *res);
-	int (*del)(struct del_args *args, struct dm_block *b);
-	int (*insert)(struct insert_args *args, struct dm_block *b, struct insert_result *res);
-	int (*remove)(struct remove_args *args, struct dm_block *b);
+	 * Shifting may cause entries to be merged, so don't assume you know
+	 * the nr_entries after a shift.
+	 */
+	void (*rebalance2)(struct dm_transaction_manager * tm,
+			   struct dm_block * left, struct dm_block * right,
+			   struct rebalance_result * res);
+	void (*rebalance3)(struct dm_transaction_manager * tm,
+			   struct dm_block * left, struct dm_block * center,
+			   struct dm_block * right,
+			   struct rebalance_result * res);
+	int (*del)(struct del_args * args, struct dm_block * b);
+	int (*insert)(struct insert_args * args, struct dm_block * b,
+		      struct insert_result * res);
+	int (*remove)(struct remove_args * args, struct dm_block * b);
 };
 
 static int get_ops(struct node_header *h, struct node_ops **ops);
-static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b, unsigned *space);
+static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b,
+			       unsigned *space);
 
 /*----------------------------------------------------------------*/
 
@@ -185,8 +188,7 @@ static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b, 
 #define RTREE_CSUM_XOR 0x8f279d9c
 
 static void node_prep(struct dm_block_validator *v,
-		      struct dm_block *b,
-		      size_t block_size)
+		      struct dm_block *b, size_t block_size)
 {
 	struct node_header *h = dm_block_data(b);
 
@@ -197,8 +199,7 @@ static void node_prep(struct dm_block_validator *v,
 }
 
 static int node_check(struct dm_block_validator *v,
-		      struct dm_block *b,
-		      size_t block_size)
+		      struct dm_block *b, size_t block_size)
 {
 	struct node_header *h = dm_block_data(b);
 	uint32_t csum;
@@ -209,9 +210,12 @@ static int node_check(struct dm_block_validator *v,
 		return -ENOTBLK;
 	}
 
-	csum = dm_bm_checksum(&h->flags, block_size - sizeof(__le32), RTREE_CSUM_XOR);
+	csum =
+	    dm_bm_checksum(&h->flags, block_size - sizeof(__le32),
+			   RTREE_CSUM_XOR);
 	if (csum != le32_to_cpu(h->csum)) {
-		DMERR_LIMIT("node_check failed: csum %u != wanted %u", csum, le32_to_cpu(h->csum));
+		DMERR_LIMIT("node_check failed: csum %u != wanted %u", csum,
+			    le32_to_cpu(h->csum));
 		return -EILSEQ;
 	}
 
@@ -253,7 +257,8 @@ static int get_mapping(struct leaf_node *n, int i, struct dm_mapping *out)
 }
 
 // FIXME: accepts disk_mapping rather than leaf_node
-static void set_len(struct leaf_node *n, int i, uint32_t len) {
+static void set_len(struct leaf_node *n, int i, uint32_t len)
+{
 	struct disk_mapping *value_le = n->values + i;
 	uint32_t len_time = le32_to_cpu(value_le->len_time);
 	len_time &= (1 << 20) - 1;
@@ -263,8 +268,8 @@ static void set_len(struct leaf_node *n, int i, uint32_t len) {
 
 /*----------------------------------------------------------------*/
 
-static void init_node_info(struct node_info *info, dm_block_t loc, dm_block_t lowest_key,
-			   unsigned nr_entries)
+static void init_node_info(struct node_info *info, dm_block_t loc,
+			   dm_block_t lowest_key, unsigned nr_entries)
 {
 	info->loc = loc;
 	info->lowest_key = lowest_key;
@@ -308,11 +313,11 @@ static void array_insert(void *base, size_t elt_size, unsigned nr_elts,
 }
 
 static void array_erase(void *base, size_t elt_size, unsigned nr_elts,
-                        unsigned index)
+			unsigned index)
 {
 	memmove(base + (elt_size * index),
-                base + (elt_size * (index + 1)),
-                (nr_elts - index - 1) * elt_size);
+		base + (elt_size * (index + 1)),
+		(nr_elts - index - 1) * elt_size);
 }
 
 /*----------------------------------------------------------------*/
@@ -345,7 +350,7 @@ static int del_(struct del_args *args, dm_block_t loc)
 	dm_tm_unlock(args->tm, b);
 
 	if (!r)
-		dm_tm_dec(args->tm, loc); // FIXME: return errors form dm_tm_dec()?
+		dm_tm_dec(args->tm, loc);	// FIXME: return errors form dm_tm_dec()?
 
 	return r;
 }
@@ -369,32 +374,42 @@ static void internal_move(struct internal_node *n, int shift)
 	if (shift < 0) {
 		shift = -shift;
 		BUG_ON(shift > nr_entries);
-		memmove(n->keys, n->keys + shift, (nr_entries - shift) * sizeof(n->keys[0]));
-		memmove(n->values, n->values + shift, (nr_entries - shift) * sizeof(n->values[0]));
+		memmove(n->keys, n->keys + shift,
+			(nr_entries - shift) * sizeof(n->keys[0]));
+		memmove(n->values, n->values + shift,
+			(nr_entries - shift) * sizeof(n->values[0]));
 	} else {
 		BUG_ON(nr_entries + shift > INTERNAL_NR_ENTRIES);
-		memmove(n->keys + shift, n->keys, nr_entries * sizeof(n->keys[0]));
-		memmove(n->values + shift, n->values, nr_entries * sizeof(n->values[0]));
+		memmove(n->keys + shift, n->keys,
+			nr_entries * sizeof(n->keys[0]));
+		memmove(n->values + shift, n->values,
+			nr_entries * sizeof(n->values[0]));
 	}
 }
 
-static void internal_copy(struct internal_node *left, struct internal_node *right, int shift)
+static void internal_copy(struct internal_node *left,
+			  struct internal_node *right, int shift)
 {
 	uint32_t nr_left = le32_to_cpu(left->header.nr_entries);
 
 	if (shift < 0) {
 		shift = -shift;
 		BUG_ON(nr_left + shift > INTERNAL_NR_ENTRIES);
-		memcpy(left->keys + nr_left, right->keys, shift * sizeof(left->keys[0]));
-		memcpy(left->values + nr_left, right->values, shift * sizeof(left->values[0]));
+		memcpy(left->keys + nr_left, right->keys,
+		       shift * sizeof(left->keys[0]));
+		memcpy(left->values + nr_left, right->values,
+		       shift * sizeof(left->values[0]));
 	} else {
 		BUG_ON(shift > INTERNAL_NR_ENTRIES);
-		memcpy(right->keys, left->keys + (nr_left - shift), shift * sizeof(left->keys[0]));
-		memcpy(right->values, left->values + (nr_left - shift), shift * sizeof(left->values[0]));
+		memcpy(right->keys, left->keys + (nr_left - shift),
+		       shift * sizeof(left->keys[0]));
+		memcpy(right->values, left->values + (nr_left - shift),
+		       shift * sizeof(left->values[0]));
 	}
 }
 
-static void internal_shift(struct dm_block *left, struct dm_block *right, int count)
+static void internal_shift(struct dm_block *left, struct dm_block *right,
+			   int count)
 {
 	struct internal_node *l = dm_block_data(left);
 	struct internal_node *r = dm_block_data(right);
@@ -418,7 +433,9 @@ static void internal_shift(struct dm_block *left, struct dm_block *right, int co
 }
 
 static void redist2_internal(struct dm_block *left_, struct dm_block *right_);
-static void internal_rebalance2(struct dm_transaction_manager *tm, struct dm_block *left, struct dm_block *right, struct rebalance_result *res)
+static void internal_rebalance2(struct dm_transaction_manager *tm,
+				struct dm_block *left, struct dm_block *right,
+				struct rebalance_result *res)
 {
 	struct internal_node *l = dm_block_data(left);
 	struct internal_node *r = dm_block_data(right);
@@ -432,20 +449,25 @@ static void internal_rebalance2(struct dm_transaction_manager *tm, struct dm_blo
 		dm_tm_dec(tm, dm_block_location(right));
 		res->nr_nodes = 1;
 		init_node_info(&res->nodes[0], dm_block_location(left),
-                               le64_to_cpu(l->keys[0]), le32_to_cpu(l->header.nr_entries));
+			       le64_to_cpu(l->keys[0]),
+			       le32_to_cpu(l->header.nr_entries));
 
 	} else {
 		redist2_internal(left, right);
 		res->nr_nodes = 2;
 		init_node_info(&res->nodes[0], dm_block_location(left),
-                               le64_to_cpu(l->keys[0]), le32_to_cpu(l->header.nr_entries));
+			       le64_to_cpu(l->keys[0]),
+			       le32_to_cpu(l->header.nr_entries));
 		init_node_info(&res->nodes[1], dm_block_location(right),
-                               le64_to_cpu(r->keys[0]), le32_to_cpu(r->header.nr_entries));
+			       le64_to_cpu(r->keys[0]),
+			       le32_to_cpu(r->header.nr_entries));
 	}
 }
 
 static void internal_delete_center_node(struct dm_transaction_manager *tm,
-					struct dm_block *left, struct dm_block *center, struct dm_block *right)
+					struct dm_block *left,
+					struct dm_block *center,
+					struct dm_block *right)
 {
 	struct internal_node *l = dm_block_data(left);
 	struct internal_node *c = dm_block_data(center);
@@ -455,7 +477,8 @@ static void internal_delete_center_node(struct dm_transaction_manager *tm,
 	uint32_t nr_center = le32_to_cpu(c->header.nr_entries);
 	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
 
-	unsigned shift = min((uint32_t)INTERNAL_NR_ENTRIES - nr_left, nr_center);
+	unsigned shift =
+	    min((uint32_t) INTERNAL_NR_ENTRIES - nr_left, nr_center);
 
 	BUG_ON(nr_left + shift > INTERNAL_NR_ENTRIES);
 	internal_shift(left, center, -shift);
@@ -470,9 +493,11 @@ static void internal_delete_center_node(struct dm_transaction_manager *tm,
 	redist2_internal(left, right);
 }
 
-static void redist3_internal(struct dm_block *left_, struct dm_block *center_, struct dm_block *right_);
+static void redist3_internal(struct dm_block *left_, struct dm_block *center_,
+			     struct dm_block *right_);
 static void internal_rebalance3(struct dm_transaction_manager *tm,
-				struct dm_block *left, struct dm_block *center, struct dm_block *right,
+				struct dm_block *left, struct dm_block *center,
+				struct dm_block *right,
 				struct rebalance_result *res)
 {
 	struct internal_node *l = dm_block_data(left);
@@ -489,19 +514,24 @@ static void internal_rebalance3(struct dm_transaction_manager *tm,
 		internal_delete_center_node(tm, left, center, right);
 		res->nr_nodes = 2;
 		init_node_info(&res->nodes[0], dm_block_location(left),
-                               le64_to_cpu(l->keys[0]), le32_to_cpu(l->header.nr_entries));
+			       le64_to_cpu(l->keys[0]),
+			       le32_to_cpu(l->header.nr_entries));
 		init_node_info(&res->nodes[1], dm_block_location(right),
-                               le64_to_cpu(r->keys[0]), le32_to_cpu(r->header.nr_entries));
+			       le64_to_cpu(r->keys[0]),
+			       le32_to_cpu(r->header.nr_entries));
 
 	} else {
 		redist3_internal(left, center, right);
 		res->nr_nodes = 3;
 		init_node_info(&res->nodes[0], dm_block_location(left),
-                               le64_to_cpu(l->keys[0]), le32_to_cpu(l->header.nr_entries));
+			       le64_to_cpu(l->keys[0]),
+			       le32_to_cpu(l->header.nr_entries));
 		init_node_info(&res->nodes[1], dm_block_location(center),
-                               le64_to_cpu(c->keys[0]), le32_to_cpu(c->header.nr_entries));
+			       le64_to_cpu(c->keys[0]),
+			       le32_to_cpu(c->header.nr_entries));
 		init_node_info(&res->nodes[2], dm_block_location(right),
-                               le64_to_cpu(r->keys[0]), le32_to_cpu(r->header.nr_entries));
+			       le64_to_cpu(r->keys[0]),
+			       le32_to_cpu(r->header.nr_entries));
 	}
 }
 
@@ -532,14 +562,16 @@ static int internal_del(struct del_args *args, struct dm_block *b)
 }
 
 static void insert_into_internal(struct internal_node *node, unsigned index,
-		      	        uint64_t key, dm_block_t value)
+				 uint64_t key, dm_block_t value)
 {
 	uint32_t nr_entries = le32_to_cpu(node->header.nr_entries);
 	__le64 key_le = cpu_to_le64(key);
 	__le64 value_le = cpu_to_le64(value);
 
-	array_insert(node->keys, sizeof(node->keys[0]), nr_entries, index, &key_le);
-	array_insert(node->values, sizeof(node->values[0]), nr_entries, index, &value_le);
+	array_insert(node->keys, sizeof(node->keys[0]), nr_entries, index,
+		     &key_le);
+	array_insert(node->values, sizeof(node->values[0]), nr_entries, index,
+		     &value_le);
 	node->header.nr_entries = cpu_to_le32(nr_entries + 1);
 }
 
@@ -554,7 +586,7 @@ static void redist2_internal(struct dm_block *left_, struct dm_block *right_)
 
 	// FIXME: these are the same
 	if (nr_left < target_left) {
-		int delta = (int) nr_left - (int) target_left;
+		int delta = (int)nr_left - (int)target_left;
 		internal_shift(left_, right_, delta);
 
 	} else if (nr_left > target_left) {
@@ -563,7 +595,8 @@ static void redist2_internal(struct dm_block *left_, struct dm_block *right_)
 	}
 }
 
-static void redist3_internal(struct dm_block *left_, struct dm_block *center_, struct dm_block *right_)
+static void redist3_internal(struct dm_block *left_, struct dm_block *center_,
+			     struct dm_block *right_)
 {
 	struct internal_node *left = dm_block_data(left_);
 	struct internal_node *center = dm_block_data(center_);
@@ -606,19 +639,20 @@ static void redist3_internal(struct dm_block *left_, struct dm_block *center_, s
 	}
 }
 
-
-static int inc_children(struct dm_transaction_manager *tm, struct dm_space_map *data_sm, struct dm_block *b) {
+static int inc_children(struct dm_transaction_manager *tm,
+			struct dm_space_map *data_sm, struct dm_block *b)
+{
 	struct node_header *h = dm_block_data(b);
 	uint32_t flags = le32_to_cpu(h->flags);
 	uint32_t nr_entries = le32_to_cpu(h->nr_entries);
 
 	if (flags == INTERNAL_NODE) {
-		struct internal_node *n = (struct internal_node*)h;
+		struct internal_node *n = (struct internal_node *)h;
 		dm_tm_with_runs(tm, n->values, nr_entries, dm_tm_inc_range);
 	} else if (flags == LEAF_NODE) {
-		struct leaf_node *n = (struct leaf_node*)h;
+		struct leaf_node *n = (struct leaf_node *)h;
 		int i;
-		for (i = 0; i < nr_entries; i++) { // FIXME: loop through the value ptr
+		for (i = 0; i < nr_entries; i++) {	// FIXME: loop through the value ptr
 			struct dm_mapping m;
 			dm_block_t data_end;
 			get_mapping(n, i, &m);
@@ -626,14 +660,15 @@ static int inc_children(struct dm_transaction_manager *tm, struct dm_space_map *
 			dm_sm_inc_blocks(data_sm, m.data_begin, data_end);
 		}
 	} else {
-	    return -EINVAL;
+		return -EINVAL;
 	}
 
 	return 0;
 }
 
-static int shadow_node(struct dm_transaction_manager *tm, struct dm_space_map *data_sm,
-                       dm_block_t loc, struct dm_block **result)
+static int shadow_node(struct dm_transaction_manager *tm,
+		       struct dm_space_map *data_sm, dm_block_t loc,
+		       struct dm_block **result)
 {
 	int inc, r;
 
@@ -648,7 +683,8 @@ static int shadow_node(struct dm_transaction_manager *tm, struct dm_space_map *d
 }
 
 // FIXME: rename
-static int insert_aux(struct insert_args *args, dm_block_t loc, struct insert_result *res)
+static int insert_aux(struct insert_args *args, dm_block_t loc,
+		      struct insert_result *res)
 {
 	int r;
 	struct dm_block *b;
@@ -669,7 +705,8 @@ static int insert_aux(struct insert_args *args, dm_block_t loc, struct insert_re
 	return r;
 }
 
-static int rebalance3(struct insert_args *args, struct internal_node *n, unsigned index, int *result)
+static int rebalance3(struct insert_args *args, struct internal_node *n,
+		      unsigned index, int *result)
 {
 	int r;
 	struct rebalance_result res;
@@ -720,14 +757,15 @@ static int rebalance3(struct insert_args *args, struct internal_node *n, unsigne
 		*result = MERGED_INTO_ONE;
 	}
 
-out:
+ out:
 	dm_tm_unlock(args->tm, left);
 	dm_tm_unlock(args->tm, center);
 	dm_tm_unlock(args->tm, right);
 	return r;
 }
 
-static int rebalance2(struct insert_args *args, struct internal_node *n, unsigned index, int *result)
+static int rebalance2(struct insert_args *args, struct internal_node *n,
+		      unsigned index, int *result)
 {
 	int r;
 	struct rebalance_result res;
@@ -771,13 +809,14 @@ static int rebalance2(struct insert_args *args, struct internal_node *n, unsigne
 		*result = REDIST2;
 	}
 
-out:
+ out:
 	dm_tm_unlock(args->tm, left);
 	dm_tm_unlock(args->tm, right);
 	return r;
 }
 
-static int refill(struct insert_args *args, struct internal_node *n, unsigned index, int *res)
+static int refill(struct insert_args *args, struct internal_node *n,
+		  unsigned index, int *res)
 {
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
 	BUG_ON(nr_entries < 2);
@@ -792,7 +831,8 @@ static int refill(struct insert_args *args, struct internal_node *n, unsigned in
 	return 0;
 }
 
-static int rebalance(struct insert_args *args, struct internal_node *n, unsigned index, int *res)
+static int rebalance(struct insert_args *args, struct internal_node *n,
+		     unsigned index, int *res)
 {
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
 	unsigned free_space;
@@ -801,7 +841,8 @@ static int rebalance(struct insert_args *args, struct internal_node *n, unsigned
 	BUG_ON(nr_entries < 2);
 
 	if (index > 0) {
-		r = get_node_free_space(args->tm, n->values[index - 1], &free_space);
+		r = get_node_free_space(args->tm, n->values[index - 1],
+					&free_space);
 		if (r)
 			return r;
 
@@ -812,7 +853,8 @@ static int rebalance(struct insert_args *args, struct internal_node *n, unsigned
 	}
 
 	if (index < nr_entries - 1) {
-		r = get_node_free_space(args->tm, n->values[index + 1], &free_space);
+		r = get_node_free_space(args->tm, n->values[index + 1],
+					&free_space);
 		if (r)
 			return r;
 
@@ -822,13 +864,14 @@ static int rebalance(struct insert_args *args, struct internal_node *n, unsigned
 			*res = NOTHING;
 		}
 	} else {
-	    *res = NOTHING;
+		*res = NOTHING;
 	}
 
 	return 0;
 }
 
-static int internal_insert(struct insert_args *args, struct dm_block *b, struct insert_result *res)
+static int internal_insert(struct insert_args *args, struct dm_block *b,
+			   struct insert_result *res)
 {
 	int r, i;
 	dm_block_t child_b;
@@ -870,7 +913,8 @@ static int internal_insert(struct insert_args *args, struct dm_block *b, struct 
 
 		res->nr_nodes = 1;
 		init_node_info(&res->nodes[0], dm_block_location(b),
-                               le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+			       le64_to_cpu(n->keys[0]),
+			       le32_to_cpu(n->header.nr_entries));
 
 		if (rebalance_outcome > 0)
 			res->stats[rebalance_outcome]++;
@@ -879,10 +923,12 @@ static int internal_insert(struct insert_args *args, struct dm_block *b, struct 
 		n->values[i] = cpu_to_le64(res->nodes[0].loc);
 
 		if (nr_entries < INTERNAL_NR_ENTRIES) {
-			insert_into_internal(n, i + 1, res->nodes[1].lowest_key, res->nodes[1].loc);
+			insert_into_internal(n, i + 1, res->nodes[1].lowest_key,
+					     res->nodes[1].loc);
 			res->nr_nodes = 1;
 			init_node_info(&res->nodes[0], dm_block_location(b),
-	                               le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+				       le64_to_cpu(n->keys[0]),
+				       le32_to_cpu(n->header.nr_entries));
 
 		} else {
 			/* split the node */
@@ -908,13 +954,17 @@ static int internal_insert(struct insert_args *args, struct dm_block *b, struct 
 				n2 = sib_n;
 				i -= le32_to_cpu(n->header.nr_entries);
 			}
-			insert_into_internal(n2, i + 1, res->nodes[1].lowest_key, res->nodes[1].loc);
+			insert_into_internal(n2, i + 1,
+					     res->nodes[1].lowest_key,
+					     res->nodes[1].loc);
 
 			res->nr_nodes = 2;
 			init_node_info(&res->nodes[0], dm_block_location(b),
-	                               le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+				       le64_to_cpu(n->keys[0]),
+				       le32_to_cpu(n->header.nr_entries));
 			init_node_info(&res->nodes[1], dm_block_location(sib),
-	                               le64_to_cpu(sib_n->keys[0]), le32_to_cpu(sib_n->header.nr_entries));
+				       le64_to_cpu(sib_n->keys[0]),
+				       le32_to_cpu(sib_n->header.nr_entries));
 
 			dm_tm_unlock(args->tm, sib);
 			res->action[INTERNAL_SPLIT]++;
@@ -946,8 +996,8 @@ static bool adjacent_mapping(struct dm_mapping *left, struct dm_mapping *right)
 	uint64_t thin_delta = right->thin_begin - left->thin_begin;
 
 	return (thin_delta == left->len) &&
-               (left->data_begin + (uint64_t) left->len == right->data_begin) &&
-               (left->time == right->time);
+	    (left->data_begin + (uint64_t) left->len == right->data_begin) &&
+	    (left->time == right->time);
 }
 
 static int test_relation(struct dm_mapping *left, struct dm_mapping *right)
@@ -956,7 +1006,7 @@ static int test_relation(struct dm_mapping *left, struct dm_mapping *right)
 	int flags = 0;
 
 	if ((left->data_begin + thin_delta == right->data_begin) &&
-            (left->time == right->time))
+	    (left->time == right->time))
 		flags |= COMPATIBLE;
 	else
 		flags |= INCOMPATIBLE;
@@ -966,8 +1016,8 @@ static int test_relation(struct dm_mapping *left, struct dm_mapping *right)
 	else if (thin_delta > left->len)
 		flags |= DISJOINTED;
 	else {
-		uint64_t left_end = left->thin_begin + (uint64_t)left->len;
-		uint64_t right_end = right->thin_begin + (uint64_t)right->len;
+		uint64_t left_end = left->thin_begin + (uint64_t) left->len;
+		uint64_t right_end = right->thin_begin + (uint64_t) right->len;
 		if (thin_delta == 0 && left_end == right_end)
 			flags |= OVERLAPPED_ALL;
 		else if (thin_delta == 0)
@@ -992,28 +1042,37 @@ static void leaf_move(struct leaf_node *n, int shift)
 	} else if (shift < 0) {
 		shift = -shift;
 		BUG_ON(shift > nr_entries);
-		memmove(n->keys, n->keys + shift, (nr_entries - shift) * sizeof(n->keys[0]));
-		memmove(n->values, n->values + shift, (nr_entries - shift) * sizeof(n->values[0]));
+		memmove(n->keys, n->keys + shift,
+			(nr_entries - shift) * sizeof(n->keys[0]));
+		memmove(n->values, n->values + shift,
+			(nr_entries - shift) * sizeof(n->values[0]));
 	} else {
 		BUG_ON(nr_entries + shift > LEAF_NR_ENTRIES);
-		memmove(n->keys + shift, n->keys, nr_entries * sizeof(n->keys[0]));
-		memmove(n->values + shift, n->values, nr_entries * sizeof(n->values[0]));
+		memmove(n->keys + shift, n->keys,
+			nr_entries * sizeof(n->keys[0]));
+		memmove(n->values + shift, n->values,
+			nr_entries * sizeof(n->values[0]));
 	}
 }
 
-static void leaf_copy(struct leaf_node *left, struct leaf_node *right, int shift)
+static void leaf_copy(struct leaf_node *left, struct leaf_node *right,
+		      int shift)
 {
 	uint32_t nr_left = le32_to_cpu(left->header.nr_entries);
 
 	if (shift < 0) {
 		shift = -shift;
 		BUG_ON(nr_left + shift > LEAF_NR_ENTRIES);
-		memcpy(left->keys + nr_left, right->keys, shift * sizeof(left->keys[0]));
-		memcpy(left->values + nr_left, right->values, shift * sizeof(left->values[0]));
+		memcpy(left->keys + nr_left, right->keys,
+		       shift * sizeof(left->keys[0]));
+		memcpy(left->values + nr_left, right->values,
+		       shift * sizeof(left->values[0]));
 	} else {
 		BUG_ON(shift > LEAF_NR_ENTRIES);
-		memcpy(right->keys, left->keys + (nr_left - shift), shift * sizeof(left->keys[0]));
-		memcpy(right->values, left->values + (nr_left - shift), shift * sizeof(left->values[0]));
+		memcpy(right->keys, left->keys + (nr_left - shift),
+		       shift * sizeof(left->keys[0]));
+		memcpy(right->values, left->values + (nr_left - shift),
+		       shift * sizeof(left->values[0]));
 	}
 }
 
@@ -1044,24 +1103,26 @@ static void leaf_shift(struct dm_block *left, struct dm_block *right, int count)
 
 	uint32_t nr_left = le32_to_cpu(l->header.nr_entries);
 	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
-	
+
 	if (!count)
 		return;
 
 	if (nr_left && nr_right) {
 		/*
-                 * Check to see if we can merge the last entry from the left
-                 * node with the first entry from the right node.
-                 */
-		struct dm_mapping ll; // last left
-		struct dm_mapping fr; // first right
+		 * Check to see if we can merge the last entry from the left
+		 * node with the first entry from the right node.
+		 */
+		struct dm_mapping ll;	// last left
+		struct dm_mapping fr;	// first right
 		get_mapping(l, nr_left - 1, &ll);
 		get_mapping(r, 0, &fr);
 
-		if (adjacent_mapping(&ll, &fr) && ll.len + fr.len <= MAPPINGS_MAX_LEN) {
+		if (adjacent_mapping(&ll, &fr)
+		    && ll.len + fr.len <= MAPPINGS_MAX_LEN) {
 			l->header.nr_entries = cpu_to_le32(nr_left - 1);
 			r->keys[0] = l->keys[nr_left - 1];
-			r->values[0].data_begin = l->values[nr_left - 1].data_begin;
+			r->values[0].data_begin =
+			    l->values[nr_left - 1].data_begin;
 			set_len(r, 0, ll.len + fr.len);
 
 			// Adjust the count, since there's one fewer entries in left now
@@ -1075,8 +1136,8 @@ static void leaf_shift(struct dm_block *left, struct dm_block *right, int count)
 
 static void redist2_leaf(struct dm_block *left_, struct dm_block *right_);
 static void leaf_rebalance2(struct dm_transaction_manager *tm,
-                            struct dm_block *left, struct dm_block *right,
-                            struct rebalance_result *res)
+			    struct dm_block *left, struct dm_block *right,
+			    struct rebalance_result *res)
 {
 	struct leaf_node *l = dm_block_data(left);
 	struct leaf_node *r = dm_block_data(right);
@@ -1090,20 +1151,25 @@ static void leaf_rebalance2(struct dm_transaction_manager *tm,
 		dm_tm_dec(tm, dm_block_location(right));
 		res->nr_nodes = 1;
 		init_node_info(&res->nodes[0], dm_block_location(left),
-                               le64_to_cpu(l->keys[0]), le32_to_cpu(l->header.nr_entries));
+			       le64_to_cpu(l->keys[0]),
+			       le32_to_cpu(l->header.nr_entries));
 
 	} else {
 		redist2_leaf(left, right);
 		res->nr_nodes = 2;
 		init_node_info(&res->nodes[0], dm_block_location(left),
-                               le64_to_cpu(l->keys[0]), le32_to_cpu(l->header.nr_entries));
+			       le64_to_cpu(l->keys[0]),
+			       le32_to_cpu(l->header.nr_entries));
 		init_node_info(&res->nodes[1], dm_block_location(right),
-                               le64_to_cpu(r->keys[0]), le32_to_cpu(r->header.nr_entries));
+			       le64_to_cpu(r->keys[0]),
+			       le32_to_cpu(r->header.nr_entries));
 	}
 }
 
 static void leaf_delete_center_node(struct dm_transaction_manager *tm,
-				    struct dm_block *left, struct dm_block *center, struct dm_block *right)
+				    struct dm_block *left,
+				    struct dm_block *center,
+				    struct dm_block *right)
 {
 	struct leaf_node *l = dm_block_data(left);
 	struct leaf_node *c = dm_block_data(center);
@@ -1113,7 +1179,8 @@ static void leaf_delete_center_node(struct dm_transaction_manager *tm,
 	uint32_t nr_center = le32_to_cpu(c->header.nr_entries);
 	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
 
-	unsigned shift = min((uint32_t)LEAF_NR_ENTRIES - nr_left - 8, nr_center);
+	unsigned shift =
+	    min((uint32_t) LEAF_NR_ENTRIES - nr_left - 8, nr_center);
 
 	BUG_ON(nr_left + shift > LEAF_NR_ENTRIES);
 	leaf_shift(left, center, -shift);
@@ -1128,10 +1195,12 @@ static void leaf_delete_center_node(struct dm_transaction_manager *tm,
 	redist2_leaf(left, right);
 }
 
-static void redist3_leaf(struct dm_block *left_, struct dm_block *center_, struct dm_block *right_);
+static void redist3_leaf(struct dm_block *left_, struct dm_block *center_,
+			 struct dm_block *right_);
 static void leaf_rebalance3(struct dm_transaction_manager *tm,
-				struct dm_block *left, struct dm_block *center, struct dm_block *right,
-				struct rebalance_result *res)
+			    struct dm_block *left, struct dm_block *center,
+			    struct dm_block *right,
+			    struct rebalance_result *res)
 {
 	struct leaf_node *l = dm_block_data(left);
 	struct leaf_node *c = dm_block_data(center);
@@ -1141,25 +1210,30 @@ static void leaf_rebalance3(struct dm_transaction_manager *tm,
 	uint32_t nr_center = le32_to_cpu(c->header.nr_entries);
 	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
 
-	unsigned threshold = (LEAF_NR_ENTRIES - 8) * 2; // TODO: try different threshold
+	unsigned threshold = (LEAF_NR_ENTRIES - 8) * 2;	// TODO: try different threshold
 
 	if (nr_left + nr_center + nr_right <= threshold) {
 		leaf_delete_center_node(tm, left, center, right);
 		res->nr_nodes = 2;
 		init_node_info(&res->nodes[0], dm_block_location(left),
-                               le64_to_cpu(l->keys[0]), le32_to_cpu(l->header.nr_entries));
+			       le64_to_cpu(l->keys[0]),
+			       le32_to_cpu(l->header.nr_entries));
 		init_node_info(&res->nodes[1], dm_block_location(right),
-                               le64_to_cpu(r->keys[0]), le32_to_cpu(r->header.nr_entries));
+			       le64_to_cpu(r->keys[0]),
+			       le32_to_cpu(r->header.nr_entries));
 
 	} else {
 		redist3_leaf(left, center, right);
 		res->nr_nodes = 3;
 		init_node_info(&res->nodes[0], dm_block_location(left),
-                               le64_to_cpu(l->keys[0]), le32_to_cpu(l->header.nr_entries));
+			       le64_to_cpu(l->keys[0]),
+			       le32_to_cpu(l->header.nr_entries));
 		init_node_info(&res->nodes[1], dm_block_location(center),
-                               le64_to_cpu(c->keys[0]), le32_to_cpu(c->header.nr_entries));
+			       le64_to_cpu(c->keys[0]),
+			       le32_to_cpu(c->header.nr_entries));
 		init_node_info(&res->nodes[2], dm_block_location(right),
-                               le64_to_cpu(r->keys[0]), le32_to_cpu(r->header.nr_entries));
+			       le64_to_cpu(r->keys[0]),
+			       le32_to_cpu(r->header.nr_entries));
 	}
 }
 
@@ -1191,7 +1265,6 @@ static int leaf_del(struct del_args *args, struct dm_block *b)
 	return 0;
 }
 
-
 // FIXME: make copy/move_entries generic, then we need only one redist2
 // fn.
 static void redist2_leaf(struct dm_block *left_, struct dm_block *right_)
@@ -1205,7 +1278,7 @@ static void redist2_leaf(struct dm_block *left_, struct dm_block *right_)
 
 	// FIXME: these are the same
 	if (nr_left < target_left) {
-		int delta = (int) nr_left - (int) target_left;
+		int delta = (int)nr_left - (int)target_left;
 		leaf_shift(left_, right_, delta);
 
 	} else if (nr_left > target_left) {
@@ -1214,7 +1287,8 @@ static void redist2_leaf(struct dm_block *left_, struct dm_block *right_)
 	}
 }
 
-static void redist3_leaf(struct dm_block *left_, struct dm_block *center_, struct dm_block *right_)
+static void redist3_leaf(struct dm_block *left_, struct dm_block *center_,
+			 struct dm_block *right_)
 {
 	struct leaf_node *left = dm_block_data(left_);
 	struct leaf_node *center = dm_block_data(center_);
@@ -1256,7 +1330,9 @@ static void redist3_leaf(struct dm_block *left_, struct dm_block *center_, struc
 		}
 	}
 }
-static void leaf_insert_(struct leaf_node *n, struct dm_mapping *v, unsigned index)
+
+static void leaf_insert_(struct leaf_node *n, struct dm_mapping *v,
+			 unsigned index)
 {
 	struct disk_mapping value_le;
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
@@ -1266,12 +1342,13 @@ static void leaf_insert_(struct leaf_node *n, struct dm_mapping *v, unsigned ind
 	value_le.len_time = cpu_to_le32(pack_len_time(v->len, v->time));
 
 	array_insert(n->keys, sizeof(n->keys[0]), nr_entries, index, &key_le);
-	array_insert(n->values, sizeof(n->values[0]), nr_entries, index, &value_le);
+	array_insert(n->values, sizeof(n->values[0]), nr_entries, index,
+		     &value_le);
 	n->header.nr_entries = cpu_to_le32(nr_entries + 1);
 }
 
-static int insert_into_leaf(struct insert_args *args, struct dm_block *b, unsigned index,
-		      	    struct insert_result *res)
+static int insert_into_leaf(struct insert_args *args, struct dm_block *b,
+			    unsigned index, struct insert_result *res)
 {
 	int r;
 	struct leaf_node *n = dm_block_data(b);
@@ -1309,9 +1386,11 @@ static int insert_into_leaf(struct insert_args *args, struct dm_block *b, unsign
 
 		res->nr_nodes = 2;
 		init_node_info(&res->nodes[0], dm_block_location(b),
-                               le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+			       le64_to_cpu(n->keys[0]),
+			       le32_to_cpu(n->header.nr_entries));
 		init_node_info(&res->nodes[1], dm_block_location(sib),
-                               le64_to_cpu(sib_n->keys[0]), le32_to_cpu(sib_n->header.nr_entries));
+			       le64_to_cpu(sib_n->keys[0]),
+			       le32_to_cpu(sib_n->header.nr_entries));
 
 		dm_tm_unlock(args->tm, sib);
 
@@ -1320,7 +1399,8 @@ static int insert_into_leaf(struct insert_args *args, struct dm_block *b, unsign
 		leaf_insert_(n, args->v, index);
 		res->nr_nodes = 1;
 		init_node_info(&res->nodes[0], dm_block_location(b),
-                               le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+			       le64_to_cpu(n->keys[0]),
+			       le32_to_cpu(n->header.nr_entries));
 	}
 
 	res->flags = LEAF_NODE;
@@ -1332,13 +1412,16 @@ static void erase_from_leaf(struct leaf_node *node, unsigned index)
 {
 	uint32_t nr_entries = le32_to_cpu(node->header.nr_entries);
 	if (index < nr_entries - 1) {
-		array_erase(node->keys, sizeof(node->keys[0]), nr_entries, index);
-		array_erase(node->values, sizeof(node->values[0]), nr_entries, index);
+		array_erase(node->keys, sizeof(node->keys[0]), nr_entries,
+			    index);
+		array_erase(node->values, sizeof(node->values[0]), nr_entries,
+			    index);
 	}
 	node->header.nr_entries = cpu_to_le32(nr_entries - 1);
 }
 
-static int action_to_left(struct dm_mapping *left, struct dm_mapping *right) {
+static int action_to_left(struct dm_mapping *left, struct dm_mapping *right)
+{
 	int relation = test_relation(left, right);
 
 	//printk(KERN_DEBUG "TL left %llu right %llu, r=%x", left->thin_begin, right->thin_begin, relation);
@@ -1346,23 +1429,30 @@ static int action_to_left(struct dm_mapping *left, struct dm_mapping *right) {
 	// assume that right.len == 1, the relation falls into those categories,
 	// in which OVERLAPPED_PARTIAL is not possible:
 	switch (relation) {
-		case (ADJACENTED | COMPATIBLE):
-			if (left->len < MAPPINGS_MAX_LEN)
-				return PUSH_BACK;
-			else
-				return INSERT_NEW;
-		case (ADJACENTED | INCOMPATIBLE):
-		case (DISJOINTED | INCOMPATIBLE):
-		case (DISJOINTED | COMPATIBLE): return INSERT_NEW;
-		case (OVERLAPPED_ALL | INCOMPATIBLE): return REPLACE;
-		case (OVERLAPPED_HEAD | INCOMPATIBLE): return TRUNCATE_FRONT;
-		case (OVERLAPPED_TAIL | INCOMPATIBLE): return TRUNCATE_BACK;
-		case (OVERLAPPED_CENTER | INCOMPATIBLE): return SPLIT;
-		default: return NOOP; // incl. all other overlapped but compatible cases
+	case (ADJACENTED | COMPATIBLE):
+		if (left->len < MAPPINGS_MAX_LEN)
+			return PUSH_BACK;
+		else
+			return INSERT_NEW;
+	case (ADJACENTED | INCOMPATIBLE):
+	case (DISJOINTED | INCOMPATIBLE):
+	case (DISJOINTED | COMPATIBLE):
+		return INSERT_NEW;
+	case (OVERLAPPED_ALL | INCOMPATIBLE):
+		return REPLACE;
+	case (OVERLAPPED_HEAD | INCOMPATIBLE):
+		return TRUNCATE_FRONT;
+	case (OVERLAPPED_TAIL | INCOMPATIBLE):
+		return TRUNCATE_BACK;
+	case (OVERLAPPED_CENTER | INCOMPATIBLE):
+		return SPLIT;
+	default:
+		return NOOP;	// incl. all other overlapped but compatible cases
 	}
 }
 
-static int action_to_right(struct dm_mapping *left, struct dm_mapping *right) {
+static int action_to_right(struct dm_mapping *left, struct dm_mapping *right)
+{
 	int relation = test_relation(left, right);
 
 	//printk(KERN_DEBUG "TR left %llu right %llu, r=%x", left->thin_begin, right->thin_begin, relation);
@@ -1370,32 +1460,38 @@ static int action_to_right(struct dm_mapping *left, struct dm_mapping *right) {
 	// assume that left.len == 1, the relation falls into these categories,
 	// in which OVERLAPPED_PARTIAL is not possible:
 	switch (relation) {
-		case (ADJACENTED | COMPATIBLE):
-			if (right->len < MAPPINGS_MAX_LEN)
-				return PUSH_FRONT;
-			else
-				return INSERT_NEW;
-		case (ADJACENTED | INCOMPATIBLE):
-		case (DISJOINTED | INCOMPATIBLE):
-		case (DISJOINTED | COMPATIBLE): return INSERT_NEW;
-		default: return NOOP; // not possible
+	case (ADJACENTED | COMPATIBLE):
+		if (right->len < MAPPINGS_MAX_LEN)
+			return PUSH_FRONT;
+		else
+			return INSERT_NEW;
+	case (ADJACENTED | INCOMPATIBLE):
+	case (DISJOINTED | INCOMPATIBLE):
+	case (DISJOINTED | COMPATIBLE):
+		return INSERT_NEW;
+	default:
+		return NOOP;	// not possible
 	}
 }
 
-static void truncate_front(struct leaf_node *n, int i, uint32_t len) {
+static void truncate_front(struct leaf_node *n, int i, uint32_t len)
+{
 	struct dm_mapping m;
 	struct disk_mapping *value_le = n->values + i;
 	uint64_t delta;
 
 	get_mapping(n, i, &m);
-	delta = (uint64_t)m.len - (uint64_t)len; // cast to u64 to support underflow
+	delta = (uint64_t) m.len - (uint64_t) len;	// cast to u64 to support underflow
 	n->keys[i] = cpu_to_le64(m.thin_begin + delta);
 	value_le->data_begin = cpu_to_le32(m.data_begin + delta);
 	value_le->len_time = cpu_to_le32(pack_len_time(len, m.time));
 }
 
 // Similar to the case (e) in remove_leaf_()
-static int remove_middle_(struct dm_transaction_manager *tm, struct dm_space_map *data_sm, struct dm_block *b, int i, uint64_t thin_begin, uint64_t thin_end, struct insert_result *res)
+static int remove_middle_(struct dm_transaction_manager *tm,
+			  struct dm_space_map *data_sm, struct dm_block *b,
+			  int i, uint64_t thin_begin, uint64_t thin_end,
+			  struct insert_result *res)
 {
 	struct dm_mapping m;
 	struct dm_mapping back_half;
@@ -1428,10 +1524,12 @@ static int remove_middle_(struct dm_transaction_manager *tm, struct dm_space_map
 	if (r)
 		return r;
 
-	return dm_sm_dec_blocks(data_sm, m.data_begin + front_half_len, back_half.data_begin);
+	return dm_sm_dec_blocks(data_sm, m.data_begin + front_half_len,
+				back_half.data_begin);
 }
 
-static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i, struct insert_result *res)
+static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i,
+			    struct insert_result *res)
 {
 	struct insert_result i_res;
 	struct dm_block_manager *bm;
@@ -1439,12 +1537,14 @@ static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i,
 	int r;
 
 	// remove the middle part (might split)
-	r = remove_middle_(args->tm, args->data_sm, b, i, args->v->thin_begin, args->v->thin_begin + args->v->len, &i_res);
+	r = remove_middle_(args->tm, args->data_sm, b, i, args->v->thin_begin,
+			   args->v->thin_begin + args->v->len, &i_res);
 	if (r)
-	    return r;
+		return r;
 
 	// choose which sibling to insert the overwritten key
-	if (i_res.nr_nodes == 2 && args->v->thin_begin >= i_res.nodes[1].lowest_key) {
+	if (i_res.nr_nodes == 2
+	    && args->v->thin_begin >= i_res.nodes[1].lowest_key) {
 		bm = dm_tm_get_bm(args->tm);
 		r = dm_bm_write_lock(bm, i_res.nodes[1].loc, &validator, &b);
 		if (r)
@@ -1452,7 +1552,6 @@ static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i,
 		i -= i_res.nodes[0].nr_entries;
 		overwrite_at_right = true;
 	}
-
 	// do overwriting (might split if it didn't splitted previously)
 	r = insert_into_leaf(args, b, i + 1, res);
 	if (r) {
@@ -1460,7 +1559,6 @@ static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i,
 			dm_bm_unlock(b);
 		return r;
 	}
-
 	// return results
 	if (overwrite_at_right) {
 		res->nr_nodes = i_res.nr_nodes;
@@ -1475,7 +1573,8 @@ static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i,
 	return 0;
 }
 
-static int leaf_insert(struct insert_args *args, struct dm_block *b, struct insert_result *res)
+static int leaf_insert(struct insert_args *args, struct dm_block *b,
+		       struct insert_result *res)
 {
 	int i;
 	struct leaf_node *n = dm_block_data(b);
@@ -1489,7 +1588,6 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 	if (nr_entries == 0) {
 		return insert_into_leaf(args, b, 0, res);
 	}
-
 	// FIXME: would this be better named 'index'
 	i = lower_bound(n->keys, nr_entries, args->v->thin_begin);
 	if (i >= 0 && i < nr_entries)
@@ -1508,15 +1606,15 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 		case REPLACE:
 			if (i > 0 && action_to_left(&left, value) == PUSH_BACK) {
 				if (i + 1 < nr_entries &&
-					action_to_right(value, &right) == PUSH_FRONT &&
-					left.len + right.len < MAPPINGS_MAX_LEN)
+				    action_to_right(value, &right) == PUSH_FRONT
+				    && left.len + right.len < MAPPINGS_MAX_LEN)
 					action = MERGE_REPLACED;
 				else
 					// prefers PUSH_BACK_REPLACED rather than
 					// PUSH_FRONT_REPLACED if the merged length overflows
 					action = PUSH_BACK_REPLACED;
 			} else if (i + 1 < nr_entries &&
-					action_to_right(value, &right) == PUSH_FRONT)
+				   action_to_right(value, &right) == PUSH_FRONT)
 				action = PUSH_FRONT_REPLACED;
 			break;
 		case TRUNCATE_FRONT:
@@ -1524,13 +1622,14 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 				action = PUSH_BACK_TRUNCATED;
 			break;
 		case TRUNCATE_BACK:
-			if (i + 1 < nr_entries && action_to_right(value, &right) == PUSH_FRONT)
+			if (i + 1 < nr_entries
+			    && action_to_right(value, &right) == PUSH_FRONT)
 				action = PUSH_FRONT_TRUNCATED;
 			break;
 		case PUSH_BACK:
 			if (i + 1 < nr_entries &&
-				action_to_right(value, &right) == PUSH_FRONT &&
-				center.len + right.len < MAPPINGS_MAX_LEN)
+			    action_to_right(value, &right) == PUSH_FRONT &&
+			    center.len + right.len < MAPPINGS_MAX_LEN)
 				action = MERGE;
 			break;
 		case INSERT_NEW:
@@ -1543,50 +1642,50 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b, struct inse
 	//printk(KERN_DEBUG "key = %llu, i = %d, v = %llu, action = %u", args->v->thin_begin, i, args->v->data_begin, action);
 
 	switch (action) {
-		case PUSH_BACK:
-			set_len(n, i, center.len + 1);
-			break;
-		case PUSH_BACK_REPLACED:
-			erase_from_leaf(n, i);
-			set_len(n, i - 1, left.len + 1);
-			break;
-		case PUSH_BACK_TRUNCATED:
-			truncate_front(n, i, center.len - 1);
-			set_len(n, i - 1, left.len + 1);
-			break;
-		case PUSH_FRONT:
-			truncate_front(n, i + 1, right.len + 1);
-			break;
-		case PUSH_FRONT_REPLACED:
-			erase_from_leaf(n, i);
-			truncate_front(n, i, right.len + 1);
-			break;
-		case PUSH_FRONT_TRUNCATED:
-			set_len(n, i, center.len - 1);
-			truncate_front(n, i + 1, right.len + 1);
-			break;
-		case MERGE:
-			erase_from_leaf(n, i + 1);
-			set_len(n, i, center.len + right.len + 1);
-			break;
-		case MERGE_REPLACED:
-			erase_from_leaf(n, i); // FIXME: do not memmove twice
-			erase_from_leaf(n, i);
-			set_len(n, i - 1, left.len + right.len + 1);
-			break;
-		case TRUNCATE_BACK:
-			set_len(n, i, center.len - 1);
-			return insert_into_leaf(args, b, i + 1, res);
-		case TRUNCATE_FRONT:
-			truncate_front(n, i, center.len - 1);
-			return insert_into_leaf(args, b, i, res);
-		case REPLACE:
-			erase_from_leaf(n, i); // FIXME: do not erase to avoid memmove
-			return insert_into_leaf(args, b, i, res);
-		case INSERT_NEW:
-			return insert_into_leaf(args, b, i + 1, res);
-		case SPLIT:
-			return overwrite_middle(args, b, i, res);
+	case PUSH_BACK:
+		set_len(n, i, center.len + 1);
+		break;
+	case PUSH_BACK_REPLACED:
+		erase_from_leaf(n, i);
+		set_len(n, i - 1, left.len + 1);
+		break;
+	case PUSH_BACK_TRUNCATED:
+		truncate_front(n, i, center.len - 1);
+		set_len(n, i - 1, left.len + 1);
+		break;
+	case PUSH_FRONT:
+		truncate_front(n, i + 1, right.len + 1);
+		break;
+	case PUSH_FRONT_REPLACED:
+		erase_from_leaf(n, i);
+		truncate_front(n, i, right.len + 1);
+		break;
+	case PUSH_FRONT_TRUNCATED:
+		set_len(n, i, center.len - 1);
+		truncate_front(n, i + 1, right.len + 1);
+		break;
+	case MERGE:
+		erase_from_leaf(n, i + 1);
+		set_len(n, i, center.len + right.len + 1);
+		break;
+	case MERGE_REPLACED:
+		erase_from_leaf(n, i);	// FIXME: do not memmove twice
+		erase_from_leaf(n, i);
+		set_len(n, i - 1, left.len + right.len + 1);
+		break;
+	case TRUNCATE_BACK:
+		set_len(n, i, center.len - 1);
+		return insert_into_leaf(args, b, i + 1, res);
+	case TRUNCATE_FRONT:
+		truncate_front(n, i, center.len - 1);
+		return insert_into_leaf(args, b, i, res);
+	case REPLACE:
+		erase_from_leaf(n, i);	// FIXME: do not erase to avoid memmove
+		return insert_into_leaf(args, b, i, res);
+	case INSERT_NEW:
+		return insert_into_leaf(args, b, i + 1, res);
+	case SPLIT:
+		return overwrite_middle(args, b, i, res);
 	}
 
 	res->nr_nodes = 1;
@@ -1640,23 +1739,25 @@ int dm_rtree_empty(struct dm_transaction_manager *tm, dm_block_t *root)
 
 	return 0;
 }
+
 EXPORT_SYMBOL_GPL(dm_rtree_empty);
 
 /*----------------------------------------------------------------*/
 
-int dm_rtree_del(struct dm_transaction_manager *tm, struct dm_space_map *data_sm, dm_block_t root)
+int dm_rtree_del(struct dm_transaction_manager *tm,
+		 struct dm_space_map *data_sm, dm_block_t root)
 {
-	struct del_args args = {.tm = tm, .data_sm = data_sm};
+	struct del_args args = {.tm = tm,.data_sm = data_sm };
 	return del_(&args, root);
 
 }
+
 EXPORT_SYMBOL_GPL(dm_rtree_del);
 
 /*----------------------------------------------------------------*/
 
 int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
-                    dm_block_t key,
-                    struct dm_mapping *result)
+		    dm_block_t key, struct dm_mapping *result)
 {
 	int i, r;
 	bool found = false;
@@ -1674,7 +1775,7 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 		flags = le32_to_cpu(h->flags);
 		nr_entries = le32_to_cpu(h->nr_entries);
 
-		n = (struct internal_node *) h;
+		n = (struct internal_node *)h;
 		i = lower_bound(n->keys, nr_entries, key);
 		if (i < 0 || i >= nr_entries) {
 			dm_tm_unlock(tm, b);
@@ -1686,7 +1787,7 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 
 		else {
 			dm_block_t thin_end;
-			struct leaf_node *n = (struct leaf_node *) h;
+			struct leaf_node *n = (struct leaf_node *)h;
 
 			get_mapping(n, i, result);
 			thin_end = result->thin_begin + result->len;
@@ -1704,6 +1805,7 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 
 	return r;
 }
+
 EXPORT_SYMBOL_GPL(dm_rtree_lookup);
 
 /*----------------------------------------------------------------*/
@@ -1715,9 +1817,9 @@ EXPORT_SYMBOL_GPL(dm_rtree_lookup);
  * to the new shadow.
  */
 static int shadow_child(struct dm_transaction_manager *tm,
-                        struct dm_space_map *data_sm,
-		        struct internal_node *pn,
-		        unsigned index, struct dm_block **result)
+			struct dm_space_map *data_sm,
+			struct internal_node *pn,
+			unsigned index, struct dm_block **result)
 {
 	int r, inc;
 	dm_block_t block = le64_to_cpu(pn->values[index]);
@@ -1736,7 +1838,8 @@ static int shadow_child(struct dm_transaction_manager *tm,
 /*
  * Returns the number of spare entries in a node.
  */
-static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b, unsigned *space)
+static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b,
+			       unsigned *space)
 {
 	int r;
 	unsigned nr_entries;
@@ -1759,13 +1862,14 @@ static int get_node_free_space(struct dm_transaction_manager *tm, dm_block_t b, 
 }
 
 int dm_rtree_insert(struct dm_transaction_manager *tm,
-                    struct dm_space_map *data_sm,
-                    dm_block_t root,
-                    struct dm_mapping *value, dm_block_t *new_root, unsigned *nr_inserts)
+		    struct dm_space_map *data_sm,
+		    dm_block_t root,
+		    struct dm_mapping *value, dm_block_t *new_root,
+		    unsigned *nr_inserts)
 {
 	int r;
-	struct insert_args args = {.tm = tm, .data_sm = data_sm, .v = value};
-	struct insert_result res = {0};
+	struct insert_args args = {.tm = tm,.data_sm = data_sm,.v = value };
+	struct insert_result res = { 0 };
 	r = insert_aux(&args, root, &res);
 	if (r)
 		return r;
@@ -1795,34 +1899,35 @@ int dm_rtree_insert(struct dm_transaction_manager *tm,
 	}
 
 	/*for (i = 1; i <= 6; i++) {
-		if (res.action[i] > 0)
-			break;
-	}
-	for (j = 1; j <= 5; j++) {
-		if (res.stats[j] > 0)
-			break;
-	}
-	if (i <= 6 || j <= 5) {
-		printk(KERN_DEBUG "leaf: 0 s%u o%u u%u", res.action[LEAF_SPLIT], res.action[LEAF_OVERFLOW], res.action[LEAF_UNDERFLOW]);
-		printk(KERN_DEBUG "internal: s%u o%u u%u", res.action[INTERNAL_SPLIT], res.action[INTERNAL_OVERFLOW], res.action[INTERNAL_UNDERFLOW]);
-		printk(KERN_DEBUG "0 %u 2r%u 3r%u", res.stats[NOTHING], res.stats[REDIST2], res.stats[REDIST3]);
-		printk(KERN_DEBUG "1m%u 2m%u", res.stats[MERGED_INTO_ONE], res.stats[MERGED_INTO_TWO]);
-	}*/
+	   if (res.action[i] > 0)
+	   break;
+	   }
+	   for (j = 1; j <= 5; j++) {
+	   if (res.stats[j] > 0)
+	   break;
+	   }
+	   if (i <= 6 || j <= 5) {
+	   printk(KERN_DEBUG "leaf: 0 s%u o%u u%u", res.action[LEAF_SPLIT], res.action[LEAF_OVERFLOW], res.action[LEAF_UNDERFLOW]);
+	   printk(KERN_DEBUG "internal: s%u o%u u%u", res.action[INTERNAL_SPLIT], res.action[INTERNAL_OVERFLOW], res.action[INTERNAL_UNDERFLOW]);
+	   printk(KERN_DEBUG "0 %u 2r%u 3r%u", res.stats[NOTHING], res.stats[REDIST2], res.stats[REDIST3]);
+	   printk(KERN_DEBUG "1m%u 2m%u", res.stats[MERGED_INTO_ONE], res.stats[MERGED_INTO_TWO]);
+	   } */
 
 	dm_tm_update_stats(tm, res.action, res.stats);
 
 	return 0;
 }
+
 EXPORT_SYMBOL_GPL(dm_rtree_insert);
 
 /*----------------------------------------------------------------*/
 
 //#if 0
 static int remove_(struct dm_transaction_manager *tm,
-                   struct dm_space_map *data_sm,
-                   dm_block_t b,
-                   dm_block_t thin_begin, dm_block_t thin_end,
-                   struct remove_result *res);
+		   struct dm_space_map *data_sm,
+		   dm_block_t b,
+		   dm_block_t thin_begin, dm_block_t thin_end,
+		   struct remove_result *res);
 
 static void erase_internal_entry(struct internal_node *n, unsigned index)
 {
@@ -1830,18 +1935,23 @@ static void erase_internal_entry(struct internal_node *n, unsigned index)
 	size_t upper = nr_entries - index - 1;
 	n->header.nr_entries = cpu_to_le32(nr_entries - 1);
 	if (upper > 0) {
-		memmove(n->keys + index, n->keys + index + 1, sizeof(n->keys[0]) * upper);
-		memmove(n->values + index, n->values + index + 1, sizeof(n->values[0]) * upper);
+		memmove(n->keys + index, n->keys + index + 1,
+			sizeof(n->keys[0]) * upper);
+		memmove(n->values + index, n->values + index + 1,
+			sizeof(n->values[0]) * upper);
 	}
 }
 
-static void erase_leaf_entries(struct leaf_node *n, unsigned index_b, unsigned index_e)
+static void erase_leaf_entries(struct leaf_node *n, unsigned index_b,
+			       unsigned index_e)
 {
 	size_t upper = le32_to_cpu(n->header.nr_entries) - index_e;
 	n->header.nr_entries = cpu_to_le32(index_b + upper);
 	if (upper > 0) {
-		memmove(n->keys + index_b, n->keys + index_e, sizeof(n->keys[0]) * upper);
-		memmove(n->values + index_b, n->values + index_e, sizeof(n->values[0]) * upper);
+		memmove(n->keys + index_b, n->keys + index_e,
+			sizeof(n->keys[0]) * upper);
+		memmove(n->values + index_b, n->values + index_e,
+			sizeof(n->values[0]) * upper);
 	}
 }
 
@@ -1855,10 +1965,10 @@ static void erase_leaf_entries(struct leaf_node *n, unsigned index_b, unsigned i
  */
 // FIXME: we don't need the new_root param
 static int remove_internal_(struct dm_transaction_manager *tm,
-                            struct dm_space_map *data_sm,
-                            struct dm_block *block,
-                            dm_block_t thin_begin, dm_block_t thin_end,
-                            struct remove_result *res)
+			    struct dm_space_map *data_sm,
+			    struct dm_block *block,
+			    dm_block_t thin_begin, dm_block_t thin_end,
+			    struct remove_result *res)
 {
 	struct internal_node *n = dm_block_data(block);
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
@@ -1882,7 +1992,7 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 			// FIXME: node_end is error prone, so I'm going to just recurse for now.
 			// FIXME: Do not recurse if key >= thin_end ?
 			r = remove_(tm, data_sm, child,
-                                thin_begin, thin_end, res);
+				    thin_begin, thin_end, res);
 			if (r)
 				return r;
 
@@ -1903,26 +2013,26 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 
 			if (key >= thin_begin && next_key <= thin_end) {
 				/* the whole entry is within the removal range, so we hand over to 
-	                         * rtree_del.  FIXME: this mean _del can't call kmalloc, rewrite using
-	                         * stack/recursion.
-	                         */
-	                        // FIXME: repeated moves
-	  			child = le64_to_cpu(n->values[i]); 
-	                        erase_internal_entry(n, i);
+				 * rtree_del.  FIXME: this mean _del can't call kmalloc, rewrite using
+				 * stack/recursion.
+				 */
+				// FIXME: repeated moves
+				child = le64_to_cpu(n->values[i]);
+				erase_internal_entry(n, i);
 				i -= 1;
 				nr_entries -= 1;
-	                        {
-		                        r = dm_rtree_del(tm, data_sm, child); 
-		                        if (r) {
-			                        return r;
+				{
+					r = dm_rtree_del(tm, data_sm, child);
+					if (r) {
+						return r;
 					}
-	                        }
+				}
 			} else {
 				child = le64_to_cpu(n->values[i]);
 
 				/* There's an overlap, recurse into the child */
 				r = remove_(tm, data_sm, child,
-	                                thin_begin, thin_end, res);
+					    thin_begin, thin_end, res);
 				if (r)
 					return r;
 
@@ -1933,7 +2043,8 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 					nr_entries -= 1;
 					dm_tm_dec(tm, res->nodes[0].loc);
 				} else {
-					n->values[i] = cpu_to_le64(res->nodes[0].loc);
+					n->values[i] =
+					    cpu_to_le64(res->nodes[0].loc);
 				}
 			}
 		}
@@ -1953,7 +2064,8 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 
 		res->nr_nodes = 1;
 		init_node_info(&res->nodes[0], dm_block_location(block),
-			       le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+			       le64_to_cpu(n->keys[0]),
+			       le32_to_cpu(n->header.nr_entries));
 
 		/* adjust the node_end */
 		node_end = le64_to_cpu(n->header.node_end);
@@ -1967,7 +2079,8 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 		if (nr_entries < INTERNAL_NR_ENTRIES) {
 			dm_block_t node_end;
 
-			insert_into_internal(n, i, new_node->lowest_key, new_node->loc);
+			insert_into_internal(n, i, new_node->lowest_key,
+					     new_node->loc);
 
 			/* adjust the node_end */
 			node_end = le64_to_cpu(n->header.node_end);
@@ -1976,7 +2089,8 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 
 			res->nr_nodes = 1;
 			init_node_info(&res->nodes[0], dm_block_location(block),
-				       le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+				       le64_to_cpu(n->keys[0]),
+				       le32_to_cpu(n->header.nr_entries));
 		} else {
 			/* split the node */
 			struct dm_block *sib;
@@ -1999,15 +2113,18 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 				n2 = sib_n;
 				i -= le32_to_cpu(n->header.nr_entries);
 			}
-			insert_into_internal(n2, i, new_node->lowest_key, new_node->loc);
+			insert_into_internal(n2, i, new_node->lowest_key,
+					     new_node->loc);
 
 			// FIXME: adjust the node_end for the two nodes
 
 			res->nr_nodes = 2;
 			init_node_info(&res->nodes[0], dm_block_location(block),
-	                               le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+				       le64_to_cpu(n->keys[0]),
+				       le32_to_cpu(n->header.nr_entries));
 			init_node_info(&res->nodes[1], dm_block_location(sib),
-	                               le64_to_cpu(sib_n->keys[0]), le32_to_cpu(sib_n->header.nr_entries));
+				       le64_to_cpu(sib_n->keys[0]),
+				       le32_to_cpu(sib_n->header.nr_entries));
 
 			dm_tm_unlock(tm, sib);
 		}
@@ -2043,7 +2160,7 @@ static int remove_internal_(struct dm_transaction_manager *tm,
  * a range can increase the number of entries in the leaf, so we have to ensure
  * there's space before calling this.
  */
- 
+
 static int remove_leaf_(struct dm_transaction_manager *tm,
 			struct dm_space_map *data_sm,
 			struct dm_block *block,
@@ -2071,7 +2188,8 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 	if (m.thin_begin < thin_begin && (m.thin_begin + m.len) > thin_end) {
 		/* case e */
 		struct insert_result insert_res;
-		remove_middle_(tm, data_sm, block, i, thin_begin, thin_end, &insert_res);
+		remove_middle_(tm, data_sm, block, i, thin_begin, thin_end,
+			       &insert_res);
 		res->nr_nodes = insert_res.nr_nodes;
 		memcpy(res->nodes, insert_res.nodes, sizeof(insert_res.nodes));
 	} else {
@@ -2100,10 +2218,11 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 
 			/* case c */
 			{
-	                        dm_block_t data_end = m.data_begin + m.len;
-	                        r = dm_sm_dec_blocks(data_sm, m.data_begin, data_end);
-	                        if (r)
-		                        return r;
+				dm_block_t data_end = m.data_begin + m.len;
+				r = dm_sm_dec_blocks(data_sm, m.data_begin,
+						     data_end);
+				if (r)
+					return r;
 			}
 		}
 		within_end = i;
@@ -2123,7 +2242,8 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 				dm_block_t delta;
 
 				delta = thin_end - m.thin_begin;
-				r = dm_sm_dec_blocks(data_sm, m.data_begin, m.data_begin + delta);
+				r = dm_sm_dec_blocks(data_sm, m.data_begin,
+						     m.data_begin + delta);
 				if (r)
 					return r;
 				truncate_front(n, i, m.len - delta);
@@ -2132,14 +2252,15 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 
 		res->nr_nodes = 1;
 		init_node_info(res->nodes, dm_block_location(block),
-			       le64_to_cpu(n->keys[0]), le32_to_cpu(n->header.nr_entries));
+			       le64_to_cpu(n->keys[0]),
+			       le32_to_cpu(n->header.nr_entries));
 	}
 
 	/*
-         * We need to reread nr_entries, since erase ops from above may have
-         * changed it.
-         */
-        nr_entries = le32_to_cpu(n->header.nr_entries);
+	 * We need to reread nr_entries, since erase ops from above may have
+	 * changed it.
+	 */
+	nr_entries = le32_to_cpu(n->header.nr_entries);
 
 	/* adjust the node_end, which may have changed */
 	if (nr_entries) {
@@ -2147,20 +2268,20 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 		uint32_t len;
 		uint32_t time;
 		unpack_len_time(le32_to_cpu(value_le->len_time), &len, &time);
-		n->header.node_end = cpu_to_le64(le64_to_cpu(n->keys[nr_entries - 1]) + len);
+		n->header.node_end =
+		    cpu_to_le64(le64_to_cpu(n->keys[nr_entries - 1]) + len);
 	}
 
 	return 0;
 }
 
-
 // FIXME: removing the middle of a mapping can cause an extra entry to
 // be inserted.  So we need to ensure there's enough space.
 static int remove_(struct dm_transaction_manager *tm,
-                   struct dm_space_map *data_sm,
-                   dm_block_t b,
-                   dm_block_t thin_begin, dm_block_t thin_end,
-                   struct remove_result *res)
+		   struct dm_space_map *data_sm,
+		   dm_block_t b,
+		   dm_block_t thin_begin, dm_block_t thin_end,
+		   struct remove_result *res)
 {
 	int r, inc;
 	struct node_header *h;
@@ -2176,21 +2297,23 @@ static int remove_(struct dm_transaction_manager *tm,
 	h = dm_block_data(block);
 
 	if (le32_to_cpu(h->flags) & INTERNAL_NODE)
-		r = remove_internal_(tm, data_sm, block, thin_begin, thin_end, res);
+		r = remove_internal_(tm, data_sm, block, thin_begin, thin_end,
+				     res);
 	else
 		r = remove_leaf_(tm, data_sm, block, thin_begin, thin_end, res);
 
 	dm_tm_unlock(tm, block);
 	return r;
 }
+
 //#endif
 
 // FIXME: we need to know how many mappings were removed.
 int dm_rtree_remove(struct dm_transaction_manager *tm,
-                    struct dm_space_map *data_sm,
-                    dm_block_t b,
-                    dm_block_t thin_begin, dm_block_t thin_end,
-                    dm_block_t *new_root)
+		    struct dm_space_map *data_sm,
+		    dm_block_t b,
+		    dm_block_t thin_begin, dm_block_t thin_end,
+		    dm_block_t *new_root)
 {
 	int r;
 	struct remove_result res;
@@ -2224,13 +2347,15 @@ int dm_rtree_remove(struct dm_transaction_manager *tm,
 
 	return 0;
 }
+
 EXPORT_SYMBOL_GPL(dm_rtree_remove);
 
-int dm_rtree_find_highest_key(struct dm_transaction_manager *tm, dm_block_t root,
-			      dm_block_t *thin_block_result)
+int dm_rtree_find_highest_key(struct dm_transaction_manager *tm,
+			      dm_block_t root, dm_block_t *thin_block_result)
 {
 	return -EINVAL;
 }
+
 EXPORT_SYMBOL_GPL(dm_rtree_find_highest_key);
 
 /*----------------------------------------------------------------*/

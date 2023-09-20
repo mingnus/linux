@@ -36,7 +36,7 @@ struct dm_mapping {
  * This function sets up an empty rtree by allocating a new root
  * block and initializing it with empty nodes.
  */
-int dm_rtree_empty(struct dm_transaction_manager *tm, dm_block_t *root);
+int dm_rtree_empty(struct dm_transaction_manager *tm, dm_block_t * root);
 
 /**
  * dm_rtree_del - Delete an rtree.
@@ -52,7 +52,7 @@ int dm_rtree_empty(struct dm_transaction_manager *tm, dm_block_t *root);
  * be called on an IO path.
  */
 int dm_rtree_del(struct dm_transaction_manager *tm,
-                 struct dm_space_map *data_sm, dm_block_t root);
+		 struct dm_space_map *data_sm, dm_block_t root);
 
 /**
  * dm_rtree_lookup - Look up a key in an rtree.
@@ -68,7 +68,7 @@ int dm_rtree_del(struct dm_transaction_manager *tm,
  *  - other negative errno codes on other errors
  */
 int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
-                    dm_block_t key, struct dm_mapping *result);
+		    dm_block_t key, struct dm_mapping *result);
 
 /**
  * dm_rtree_insert - Insert or overwrite a value in an rtree.
@@ -82,9 +82,10 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
  * @nr_inserts: Pointer to a variable that will be incremented if a new value
  *              is inserted.
  */
-int dm_rtree_insert(struct dm_transaction_manager *tm, struct dm_space_map *data_sm,
-                    dm_block_t root, struct dm_mapping *value, dm_block_t *new_root,
-                    unsigned *nr_inserts);
+int dm_rtree_insert(struct dm_transaction_manager *tm,
+		    struct dm_space_map *data_sm, dm_block_t root,
+		    struct dm_mapping *value, dm_block_t * new_root,
+		    unsigned *nr_inserts);
 
 /**
  * dm_rtree_remove - Remove a range of keys from an rtree.
@@ -97,9 +98,10 @@ int dm_rtree_insert(struct dm_transaction_manager *tm, struct dm_space_map *data
  * @new_root: Pointer to a variable that will be set to the block number of the new
  *            root block if the tree shrinks.
  */
-int dm_rtree_remove(struct dm_transaction_manager *tm, struct dm_space_map *data_sm,
-                    dm_block_t root, dm_block_t thin_begin, dm_block_t thin_end,
-                    dm_block_t *new_root);
+int dm_rtree_remove(struct dm_transaction_manager *tm,
+		    struct dm_space_map *data_sm, dm_block_t root,
+		    dm_block_t thin_begin, dm_block_t thin_end,
+		    dm_block_t * new_root);
 
 /**
  * dm_rtree_find_highest_key - Find the highest key in an rtree.
@@ -113,9 +115,9 @@ int dm_rtree_remove(struct dm_transaction_manager *tm, struct dm_space_map *data
  *  - The number of key entries that have been filled out, or 0 if the tree is empty.
  *  - Negative errno codes on error.
  */
-int dm_rtree_find_highest_key(struct dm_transaction_manager *tm, dm_block_t root,
-                              dm_block_t *thin_block_result);
+int dm_rtree_find_highest_key(struct dm_transaction_manager *tm,
+			      dm_block_t root, dm_block_t * thin_block_result);
 
 /*----------------------------------------------------------------*/
 
-#endif	/* _LINUX_DM_RTREE_H */
+#endif				/* _LINUX_DM_RTREE_H */
