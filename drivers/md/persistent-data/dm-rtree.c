@@ -1718,7 +1718,7 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 			get_mapping(n, i, result);
 			thin_end = result->thin_begin + result->len;
 
-			if (key > thin_end) {
+			if (key >= thin_end) {
 				dm_tm_unlock(tm, b);
 				return -ENODATA;
 			}
