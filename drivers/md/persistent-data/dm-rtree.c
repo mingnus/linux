@@ -17,7 +17,7 @@
 // - We could add a timestamp that is updated every time the block is written (by the validator).
 //   This would be helpful for repairing damaged metadata.
 // - do we need node_end?
-// - I'm not sure shift needs to be an op
+// - remove all BUG_ONs
 
 /*----------------------------------------------------------------*/
 
@@ -162,20 +162,16 @@ enum rebalance_res {
 };
 
 struct node_ops {
+	unsigned max_entries;
+
+	int (*key_low)(struct dm_block *b, uint64_t *result);
+
 	/*
 	 * Shifting may cause entries to be merged, so don't assume you know
 	 * the nr_entries after a shift.
 	 */
 	void (*shift)(struct dm_block *left, struct dm_block *right,
 		      int count);
-
-	void (*rebalance2)(struct dm_transaction_manager * tm,
-			   struct dm_block * left, struct dm_block * right,
-			   struct rebalance_result * res);
-	void (*rebalance3)(struct dm_transaction_manager * tm,
-			   struct dm_block * left, struct dm_block * center,
-			   struct dm_block * right,
-			   struct rebalance_result * res);
 	int (*del)(struct del_args * args, struct dm_block * b);
 	int (*insert)(struct insert_args * args, struct dm_block * b,
 		      struct insert_result * res);
@@ -432,7 +428,216 @@ static int shadow_node(struct dm_transaction_manager *tm,
 	return 0;
 }
 
+// FIXME: should we pass the ops in?
+static void redist2(struct dm_block *left_, struct dm_block *right_)
+{
+	struct node_ops *ops;
+	struct node_header *left = dm_block_data(left_);
+	struct node_header *right = dm_block_data(right_);
+
+	unsigned nr_left = le32_to_cpu(left->nr_entries);
+	unsigned nr_right = le32_to_cpu(right->nr_entries);
+	unsigned total = nr_left + nr_right;
+	unsigned target_left = total / 2;
+
+	get_ops(left, &ops);
+
+	// FIXME: these are the same
+	if (nr_left < target_left) {
+		int delta = (int) nr_left - (int) target_left;
+		ops->shift(left_, right_, delta);
+
+	} else if (nr_left > target_left) {
+		int delta = nr_left - target_left;
+		ops->shift(left_, right_, delta);
+	}
+}
+
+static void redist3(struct dm_block *left_, struct dm_block *center_,
+		    struct dm_block *right_)
+{
+	struct node_ops *ops;
+	struct node_header *left = dm_block_data(left_);
+	struct node_header *center = dm_block_data(center_);
+	struct node_header *right = dm_block_data(right_);
+
+	unsigned nr_left = le32_to_cpu(left->nr_entries);
+	unsigned nr_center = le32_to_cpu(center->nr_entries);
+	unsigned nr_right = le32_to_cpu(right->nr_entries);
+
+	unsigned total = nr_left + nr_center + nr_right;
+	unsigned target_right = total / 3;
+	// FIXME: target_left = total - target_right;
+	unsigned remainder = (target_right * 3) != total;
+	unsigned target_left = target_right + remainder;
+
+	get_ops(left, &ops);
+
+	// FIXME: these are the same
+	if (nr_left < nr_right) {
+		int delta = (int) nr_left - (int) target_left;
+
+		if (delta < 0 && nr_center < -delta) {
+			ops->shift(left_, center_, -nr_center);
+			delta += nr_center;
+			ops->shift(left_, right_, delta);
+			nr_right += delta;
+		} else {
+			ops->shift(left_, center_, delta);
+		}
+
+		ops->shift(center_, right_, target_right - nr_right);
+	} else if (nr_left > target_left) {
+		int delta = (int) target_right - (int) nr_right;
+
+		if (delta > 0 && nr_center < delta) {
+			ops->shift(center_, right_, nr_center);
+			delta -= nr_center;
+			ops->shift(left_, right_, delta);
+			nr_left -= delta;
+		} else {
+			ops->shift(center_, right_, delta);
+		}
+	}
+}
+
+static void rebalance2(struct dm_transaction_manager *tm,
+		       struct dm_block *left, struct dm_block *right,
+		       struct rebalance_result *res)
+{
+	uint64_t key;
+	struct node_ops *ops;
+	struct node_header *l = dm_block_data(left);
+	struct node_header *r = dm_block_data(right);
+
+	uint32_t nr_left = le32_to_cpu(l->nr_entries);
+	uint32_t nr_right = le32_to_cpu(r->nr_entries);
+
+	get_ops(l, &ops);
+
+	if (nr_left + nr_right <= INTERNAL_NR_ENTRIES - 8) {
+		/* merge the two nodes */
+		ops->shift(left, right, -nr_right);
+		dm_tm_dec(tm, dm_block_location(right));
+		res->nr_nodes = 1;
+
+		ops->key_low(left, &key);
+		init_node_info(&res->nodes[0], dm_block_location(left),
+			       le64_to_cpu(key), le32_to_cpu(l->nr_entries));
+
+	} else {
+		redist2(left, right);
+		res->nr_nodes = 2;
+
+		// FIXME: move key_low call inside init_node_info
+		ops->key_low(left, &key);
+		init_node_info(&res->nodes[0], dm_block_location(left),
+			       le64_to_cpu(key),
+			       le32_to_cpu(l->nr_entries));
+
+		ops->key_low(right, &key);
+		init_node_info(&res->nodes[1], dm_block_location(right),
+			       le64_to_cpu(key),
+			       le32_to_cpu(r->nr_entries));
+	}
+}
+
+static void delete_center_node(struct dm_transaction_manager *tm,
+			       struct dm_block *left, struct dm_block *center,
+			       struct dm_block *right)
+{
+	unsigned shift;
+	struct node_ops *ops;
+	struct node_header *l = dm_block_data(left);
+	struct node_header *c = dm_block_data(center);
+	struct node_header *r = dm_block_data(right);
+
+	uint32_t nr_left = le32_to_cpu(l->nr_entries);
+	uint32_t nr_center = le32_to_cpu(c->nr_entries);
+	uint32_t nr_right = le32_to_cpu(r->nr_entries);
+
+	get_ops(l, &ops);
+
+	shift = min((uint32_t) ops->max_entries - nr_left - 8, nr_center);
+
+	BUG_ON(nr_left + shift > ops->max_entries);
+	ops->shift(left, center, -shift);
+
+	if (shift != nr_center) {
+		shift = nr_center - shift;
+		BUG_ON((nr_right + shift) > ops->max_entries);
+		ops->shift(center, right, shift);
+	}
+
+	dm_tm_dec(tm, dm_block_location(center));
+	redist2(left, right);
+}
+
+static void rebalance3(struct dm_transaction_manager *tm, struct dm_block *left,
+		       struct dm_block *center, struct dm_block *right,
+		       struct rebalance_result *res)
+{
+	uint64_t key;
+	struct node_ops *ops;
+	struct node_header *l = dm_block_data(left);
+	struct node_header *c = dm_block_data(center);
+	struct node_header *r = dm_block_data(right);
+
+	uint32_t nr_left = le32_to_cpu(l->nr_entries);
+	uint32_t nr_center = le32_to_cpu(c->nr_entries);
+	uint32_t nr_right = le32_to_cpu(r->nr_entries);
+
+	get_ops(l, &ops);
+
+	unsigned threshold = (ops->max_entries - 8) * 2;
+
+	if (nr_left + nr_center + nr_right <= threshold) {
+		delete_center_node(tm, left, center, right);
+		res->nr_nodes = 2;
+
+		ops->key_low(left, &key);
+		init_node_info(&res->nodes[0], dm_block_location(left),
+			       le64_to_cpu(key),
+			       le32_to_cpu(l->nr_entries));
+
+		ops->key_low(right, &key);
+		init_node_info(&res->nodes[1], dm_block_location(right),
+			       le64_to_cpu(key),
+			       le32_to_cpu(r->nr_entries));
+
+	} else {
+		redist3(left, center, right);
+		res->nr_nodes = 3;
+
+		ops->key_low(left, &key);
+		init_node_info(&res->nodes[0], dm_block_location(left),
+			       le64_to_cpu(key),
+			       le32_to_cpu(l->nr_entries));
+
+		ops->key_low(center, &key);
+		init_node_info(&res->nodes[1], dm_block_location(center),
+			       le64_to_cpu(key),
+			       le32_to_cpu(c->nr_entries));
+
+		ops->key_low(right, &key);
+		init_node_info(&res->nodes[2], dm_block_location(right),
+			       le64_to_cpu(key),
+			       le32_to_cpu(r->nr_entries));
+	}
+}
+
 /*----------------------------------------------------------------*/
+
+static int internal_key_low(struct dm_block *b, uint64_t *result)
+{
+	struct internal_node *n = dm_block_data(b);
+
+	if (!n->header.nr_entries)
+		return -ENODATA;
+
+	*result = le64_to_cpu(n->keys[0]);
+	return 0;
+}
 
 static void internal_erase(struct internal_node *n, unsigned index)
 {
@@ -509,108 +714,6 @@ static void internal_shift(struct dm_block *left, struct dm_block *right,
 	r->header.nr_entries = cpu_to_le32(nr_right + count);
 }
 
-static void internal_redist2(struct dm_block *left_, struct dm_block *right_);
-static void internal_rebalance2(struct dm_transaction_manager *tm,
-				struct dm_block *left, struct dm_block *right,
-				struct rebalance_result *res)
-{
-	struct internal_node *l = dm_block_data(left);
-	struct internal_node *r = dm_block_data(right);
-
-	uint32_t nr_left = le32_to_cpu(l->header.nr_entries);
-	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
-
-	if (nr_left + nr_right <= INTERNAL_NR_ENTRIES) {
-		/* merge the two nodes */
-		internal_shift(left, right, -le32_to_cpu(r->header.nr_entries));
-		dm_tm_dec(tm, dm_block_location(right));
-		res->nr_nodes = 1;
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(l->keys[0]),
-			       le32_to_cpu(l->header.nr_entries));
-
-	} else {
-		internal_redist2(left, right);
-		res->nr_nodes = 2;
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(l->keys[0]),
-			       le32_to_cpu(l->header.nr_entries));
-		init_node_info(&res->nodes[1], dm_block_location(right),
-			       le64_to_cpu(r->keys[0]),
-			       le32_to_cpu(r->header.nr_entries));
-	}
-}
-
-static void internal_delete_center_node(struct dm_transaction_manager *tm,
-					struct dm_block *left,
-					struct dm_block *center,
-					struct dm_block *right)
-{
-	struct internal_node *l = dm_block_data(left);
-	struct internal_node *c = dm_block_data(center);
-	struct internal_node *r = dm_block_data(right);
-
-	uint32_t nr_left = le32_to_cpu(l->header.nr_entries);
-	uint32_t nr_center = le32_to_cpu(c->header.nr_entries);
-	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
-
-	unsigned shift =
-	    min((uint32_t) INTERNAL_NR_ENTRIES - nr_left, nr_center);
-
-	BUG_ON(nr_left + shift > INTERNAL_NR_ENTRIES);
-	internal_shift(left, center, -shift);
-
-	if (shift != nr_center) {
-		shift = nr_center - shift;
-		BUG_ON((nr_right + shift) > INTERNAL_NR_ENTRIES);
-		internal_shift(center, right, shift);
-	}
-
-	dm_tm_dec(tm, dm_block_location(center));
-	internal_redist2(left, right);
-}
-
-static void internal_redist3(struct dm_block *left_, struct dm_block *center_,
-			     struct dm_block *right_);
-static void internal_rebalance3(struct dm_transaction_manager *tm,
-				struct dm_block *left, struct dm_block *center,
-				struct dm_block *right,
-				struct rebalance_result *res)
-{
-	struct internal_node *l = dm_block_data(left);
-	struct internal_node *c = dm_block_data(center);
-	struct internal_node *r = dm_block_data(right);
-
-	uint32_t nr_left = le32_to_cpu(l->header.nr_entries);
-	uint32_t nr_center = le32_to_cpu(c->header.nr_entries);
-	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
-
-	unsigned threshold = (INTERNAL_NR_ENTRIES - 8) * 2;
-
-	if (nr_left + nr_center + nr_right <= threshold) {
-		internal_delete_center_node(tm, left, center, right);
-		res->nr_nodes = 2;
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(l->keys[0]),
-			       le32_to_cpu(l->header.nr_entries));
-		init_node_info(&res->nodes[1], dm_block_location(right),
-			       le64_to_cpu(r->keys[0]),
-			       le32_to_cpu(r->header.nr_entries));
-
-	} else {
-		internal_redist3(left, center, right);
-		res->nr_nodes = 3;
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(l->keys[0]),
-			       le32_to_cpu(l->header.nr_entries));
-		init_node_info(&res->nodes[1], dm_block_location(center),
-			       le64_to_cpu(c->keys[0]),
-			       le32_to_cpu(c->header.nr_entries));
-		init_node_info(&res->nodes[2], dm_block_location(right),
-			       le64_to_cpu(r->keys[0]),
-			       le32_to_cpu(r->header.nr_entries));
-	}
-}
 
 static int internal_del(struct del_args *args, struct dm_block *b)
 {
@@ -652,71 +755,6 @@ static void insert_into_internal(struct internal_node *node, unsigned index,
 	node->header.nr_entries = cpu_to_le32(nr_entries + 1);
 }
 
-static void internal_redist2(struct dm_block *left_, struct dm_block *right_)
-{
-	struct internal_node *left = dm_block_data(left_);
-	struct internal_node *right = dm_block_data(right_);
-	unsigned nr_left = le32_to_cpu(left->header.nr_entries);
-	unsigned nr_right = le32_to_cpu(right->header.nr_entries);
-	unsigned total = nr_left + nr_right;
-	unsigned target_left = total / 2;
-
-	// FIXME: these are the same
-	if (nr_left < target_left) {
-		int delta = (int)nr_left - (int)target_left;
-		internal_shift(left_, right_, delta);
-
-	} else if (nr_left > target_left) {
-		int delta = nr_left - target_left;
-		internal_shift(left_, right_, delta);
-	}
-}
-
-static void internal_redist3(struct dm_block *left_, struct dm_block *center_,
-			     struct dm_block *right_)
-{
-	struct internal_node *left = dm_block_data(left_);
-	struct internal_node *center = dm_block_data(center_);
-	struct internal_node *right = dm_block_data(right_);
-
-	unsigned nr_left = le32_to_cpu(left->header.nr_entries);
-	unsigned nr_center = le32_to_cpu(center->header.nr_entries);
-	unsigned nr_right = le32_to_cpu(right->header.nr_entries);
-
-	unsigned total = nr_left + nr_right;
-	unsigned target_right = total / 3;
-	unsigned remainder = (target_right * 3) != total;
-	unsigned target_left = target_right + remainder;
-
-	// FIXME: these are the same
-	if (nr_left < nr_right) {
-		int delta = (int)nr_left - (int)target_left;
-
-		if (delta < 0 && nr_center < -delta) {
-			internal_shift(left_, center_, -nr_center);
-			delta += nr_center;
-			internal_shift(left_, right_, delta);
-			nr_right += delta;
-		} else {
-			internal_shift(left_, center_, delta);
-		}
-
-		internal_shift(center_, right_, target_right - nr_right);
-	} else if (nr_left > target_left) {
-		int delta = (int)target_right - (int)nr_right;
-
-		if (delta > 0 && nr_center < delta) {
-			internal_shift(center_, right_, nr_center);
-			delta -= nr_center;
-			internal_shift(left_, right_, delta);
-			nr_left -= delta;
-		} else {
-			internal_shift(center_, right_, delta);
-		}
-	}
-}
-
-
 // FIXME: rename
 static int insert_aux(struct insert_args *args, dm_block_t loc,
 		      struct insert_result *res)
@@ -740,7 +778,8 @@ static int insert_aux(struct insert_args *args, dm_block_t loc,
 	return r;
 }
 
-static int rebalance3(struct insert_args *args, struct internal_node *n,
+// FIXME: rename
+static int rebalance3_(struct insert_args *args, struct internal_node *n,
 		      unsigned index, int *result)
 {
 	int r;
@@ -769,7 +808,7 @@ static int rebalance3(struct insert_args *args, struct internal_node *n,
 	if (r)
 		goto out;
 
-	ops->rebalance3(args->tm, left, center, right, &res);
+	rebalance3(args->tm, left, center, right, &res);
 
 	if (res.nr_nodes == 2) {
 		n->keys[index] = res.nodes[0].lowest_key;
@@ -799,8 +838,8 @@ static int rebalance3(struct insert_args *args, struct internal_node *n,
 	return r;
 }
 
-static int rebalance2(struct insert_args *args, struct internal_node *n,
-		      unsigned index, int *result)
+static int rebalance2_(struct insert_args *args, struct internal_node *n,
+		       unsigned index, int *result)
 {
 	int r;
 	struct rebalance_result res;
@@ -821,7 +860,7 @@ static int rebalance2(struct insert_args *args, struct internal_node *n,
 	if (r)
 		goto out;
 
-	ops->rebalance2(args->tm, left, right, &res);
+	rebalance2(args->tm, left, right, &res);
 
 	if (res.nr_nodes == 1) {
 		if (le32_to_cpu(n->header.nr_entries == 2)) {
@@ -857,11 +896,11 @@ static int refill(struct insert_args *args, struct internal_node *n,
 	BUG_ON(nr_entries < 2);
 
 	if (index == 0)
-		rebalance2(args, n, 0, res);
+		rebalance2_(args, n, 0, res);
 	else if (index == nr_entries - 1)
-		rebalance2(args, n, nr_entries - 2, res);
+		rebalance2_(args, n, nr_entries - 2, res);
 	else
-		rebalance3(args, n, index - 1, res);
+		rebalance3_(args, n, index - 1, res);
 
 	return 0;
 }
@@ -882,7 +921,7 @@ static int rebalance(struct insert_args *args, struct internal_node *n,
 			return r;
 
 		if (free_space > 8) {
-			rebalance2(args, n, index - 1, res);
+			rebalance2_(args, n, index - 1, res);
 			return 0;
 		}
 	}
@@ -894,7 +933,7 @@ static int rebalance(struct insert_args *args, struct internal_node *n,
 			return r;
 
 		if (free_space > 8) {
-			rebalance2(args, n, index, res);
+			rebalance2_(args, n, index, res);
 		} else {
 			*res = NOTHING;
 		}
@@ -981,7 +1020,7 @@ static int internal_insert(struct insert_args *args, struct dm_block *b,
 
 			// TODO: try rebalancing with the sibling whilst insertion
 			// (i.e., split_two_into_three)
-			internal_redist2(b, sib);
+			redist2(b, sib);
 
 			if (args->v->thin_begin < le64_to_cpu(sib_n->keys[0]))
 				n2 = n;
@@ -1017,15 +1056,26 @@ static int internal_remove(struct remove_args *args, struct dm_block *b)
 }
 
 static struct node_ops internal_ops = {
+	.max_entries = INTERNAL_NR_ENTRIES,
+	.key_low = internal_key_low,
 	.shift = internal_shift,
-	.rebalance2 = internal_rebalance2,
-	.rebalance3 = internal_rebalance3,
 	.del = internal_del,
 	.insert = internal_insert,
 	.remove = internal_remove
 };
 
 /*----------------------------------------------------------------*/
+
+static int leaf_key_low(struct dm_block *b, uint64_t *result)
+{
+	struct leaf_node *n = dm_block_data(b);
+
+	if (!n->header.nr_entries)
+		return -ENODATA;
+
+	*result = le64_to_cpu(n->keys[0]);
+	return 0;
+}
 
 static bool adjacent_mapping(struct dm_mapping *left, struct dm_mapping *right)
 {
@@ -1170,109 +1220,6 @@ static void leaf_shift(struct dm_block *left, struct dm_block *right, int count)
 	leaf_shift_(l, r, count);
 }
 
-static void redist2_leaf(struct dm_block *left_, struct dm_block *right_);
-static void leaf_rebalance2(struct dm_transaction_manager *tm,
-			    struct dm_block *left, struct dm_block *right,
-			    struct rebalance_result *res)
-{
-	struct leaf_node *l = dm_block_data(left);
-	struct leaf_node *r = dm_block_data(right);
-
-	uint32_t nr_left = le32_to_cpu(l->header.nr_entries);
-	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
-
-	if (nr_left + nr_right <= LEAF_NR_ENTRIES - 8) {
-		/* merge the two nodes */
-		leaf_shift(left, right, -nr_right);
-		dm_tm_dec(tm, dm_block_location(right));
-		res->nr_nodes = 1;
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(l->keys[0]),
-			       le32_to_cpu(l->header.nr_entries));
-
-	} else {
-		redist2_leaf(left, right);
-		res->nr_nodes = 2;
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(l->keys[0]),
-			       le32_to_cpu(l->header.nr_entries));
-		init_node_info(&res->nodes[1], dm_block_location(right),
-			       le64_to_cpu(r->keys[0]),
-			       le32_to_cpu(r->header.nr_entries));
-	}
-}
-
-static void leaf_delete_center_node(struct dm_transaction_manager *tm,
-				    struct dm_block *left,
-				    struct dm_block *center,
-				    struct dm_block *right)
-{
-	struct leaf_node *l = dm_block_data(left);
-	struct leaf_node *c = dm_block_data(center);
-	struct leaf_node *r = dm_block_data(right);
-
-	uint32_t nr_left = le32_to_cpu(l->header.nr_entries);
-	uint32_t nr_center = le32_to_cpu(c->header.nr_entries);
-	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
-
-	unsigned shift =
-	    min((uint32_t) LEAF_NR_ENTRIES - nr_left - 8, nr_center);
-
-	BUG_ON(nr_left + shift > LEAF_NR_ENTRIES);
-	leaf_shift(left, center, -shift);
-
-	if (shift != nr_center) {
-		shift = nr_center - shift;
-		BUG_ON((nr_right + shift) > LEAF_NR_ENTRIES);
-		leaf_shift(center, right, shift);
-	}
-
-	dm_tm_dec(tm, dm_block_location(center));
-	redist2_leaf(left, right);
-}
-
-static void redist3_leaf(struct dm_block *left_, struct dm_block *center_,
-			 struct dm_block *right_);
-static void leaf_rebalance3(struct dm_transaction_manager *tm,
-			    struct dm_block *left, struct dm_block *center,
-			    struct dm_block *right,
-			    struct rebalance_result *res)
-{
-	struct leaf_node *l = dm_block_data(left);
-	struct leaf_node *c = dm_block_data(center);
-	struct leaf_node *r = dm_block_data(right);
-
-	uint32_t nr_left = le32_to_cpu(l->header.nr_entries);
-	uint32_t nr_center = le32_to_cpu(c->header.nr_entries);
-	uint32_t nr_right = le32_to_cpu(r->header.nr_entries);
-
-	unsigned threshold = (LEAF_NR_ENTRIES - 8) * 2;	// TODO: try different threshold
-
-	if (nr_left + nr_center + nr_right <= threshold) {
-		leaf_delete_center_node(tm, left, center, right);
-		res->nr_nodes = 2;
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(l->keys[0]),
-			       le32_to_cpu(l->header.nr_entries));
-		init_node_info(&res->nodes[1], dm_block_location(right),
-			       le64_to_cpu(r->keys[0]),
-			       le32_to_cpu(r->header.nr_entries));
-
-	} else {
-		redist3_leaf(left, center, right);
-		res->nr_nodes = 3;
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(l->keys[0]),
-			       le32_to_cpu(l->header.nr_entries));
-		init_node_info(&res->nodes[1], dm_block_location(center),
-			       le64_to_cpu(c->keys[0]),
-			       le32_to_cpu(c->header.nr_entries));
-		init_node_info(&res->nodes[2], dm_block_location(right),
-			       le64_to_cpu(r->keys[0]),
-			       le32_to_cpu(r->header.nr_entries));
-	}
-}
-
 static int leaf_del(struct del_args *args, struct dm_block *b)
 {
 	struct leaf_node *n;
@@ -1299,72 +1246,6 @@ static int leaf_del(struct del_args *args, struct dm_block *b)
 	}
 
 	return 0;
-}
-
-// FIXME: make copy/move_entries generic, then we need only one redist2
-// fn.
-static void redist2_leaf(struct dm_block *left_, struct dm_block *right_)
-{
-	struct leaf_node *left = dm_block_data(left_);
-	struct leaf_node *right = dm_block_data(right_);
-	unsigned nr_left = le32_to_cpu(left->header.nr_entries);
-	unsigned nr_right = le32_to_cpu(right->header.nr_entries);
-	unsigned total = nr_left + nr_right;
-	unsigned target_left = total / 2;
-
-	// FIXME: these are the same
-	if (nr_left < target_left) {
-		int delta = (int)nr_left - (int)target_left;
-		leaf_shift(left_, right_, delta);
-
-	} else if (nr_left > target_left) {
-		int delta = nr_left - target_left;
-		leaf_shift(left_, right_, delta);
-	}
-}
-
-static void redist3_leaf(struct dm_block *left_, struct dm_block *center_,
-			 struct dm_block *right_)
-{
-	struct leaf_node *left = dm_block_data(left_);
-	struct leaf_node *center = dm_block_data(center_);
-	struct leaf_node *right = dm_block_data(right_);
-
-	unsigned nr_left = le32_to_cpu(left->header.nr_entries);
-	unsigned nr_center = le32_to_cpu(center->header.nr_entries);
-	unsigned nr_right = le32_to_cpu(right->header.nr_entries);
-
-	unsigned total = nr_left + nr_center + nr_right;
-	unsigned target_right = total / 3;
-	unsigned remainder = (target_right * 3) != total;
-	unsigned target_left = target_right + remainder;
-
-	// FIXME: these are the same
-	if (nr_left < nr_right) {
-		int delta = (int)nr_left - (int)target_left;
-
-		if (delta < 0 && nr_center < -delta) {
-			leaf_shift(left_, center_, -nr_center);
-			delta += nr_center;
-			leaf_shift(left_, right_, delta);
-			nr_right += delta;
-		} else {
-			leaf_shift(left_, center_, delta);
-		}
-
-		leaf_shift(center_, right_, target_right - nr_right);
-	} else if (nr_left > target_left) {
-		int delta = (int)target_right - (int)nr_right;
-
-		if (delta > 0 && nr_center < delta) {
-			leaf_shift(center_, right_, nr_center);
-			delta -= nr_center;
-			leaf_shift(left_, right_, delta);
-			nr_left -= delta;
-		} else {
-			leaf_shift(center_, right_, delta);
-		}
-	}
 }
 
 static void leaf_insert_(struct leaf_node *n, struct dm_mapping *v,
@@ -1406,7 +1287,7 @@ static int insert_into_leaf(struct insert_args *args, struct dm_block *b,
 
 		// TODO: try rebalancing with the sibling whilst insertion
 		// (i.e., split_two_into_three)
-		redist2_leaf(b, sib);
+		redist2(b, sib);
 
 		/* choose which sibling to insert into */
 		if (args->v->thin_begin < le64_to_cpu(sib_n->keys[0]))
@@ -1734,9 +1615,9 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 }
 
 static struct node_ops leaf_ops = {
+	.max_entries = LEAF_NR_ENTRIES,
+	.key_low = leaf_key_low,
 	.shift = leaf_shift,
-	.rebalance2 = leaf_rebalance2,
-	.rebalance3 = leaf_rebalance3,
 	.del = leaf_del,
 	.insert = leaf_insert,
 	.remove = NULL
@@ -2117,7 +1998,7 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 			sib_n->header.flags = n->header.flags;
 			sib_n->header.nr_entries = cpu_to_le32(0);
 
-			internal_redist2(block, sib);
+			redist2(block, sib);
 
 			if (new_node->lowest_key < le64_to_cpu(sib_n->keys[0]))
 				n2 = n;
