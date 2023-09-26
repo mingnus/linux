@@ -1211,6 +1211,23 @@ static struct sym_table *build_sym_table(struct elf_info *elf)
 	return table;
 }
 
+static void free_sym_table(struct sym_table *table)
+{
+	struct sym_section *sec, *tmp;
+	struct list_head *bucket;
+	unsigned i;
+
+	for (i = 0; i < SECTION_HASH_SIZE; i++) {
+		bucket = &table->sections[i];
+		list_for_each_entry_safe(sec, tmp, bucket, list) {
+			free(sec->sym);
+			free(sec);
+		}
+	}
+
+	free(table);
+}
+
 static unsigned lower_bound(struct sym_section *section, Elf_Addr addr)
 {
 	Elf_Sym *sym;
@@ -1925,6 +1942,7 @@ static void read_symbols(const char *modname)
 		return;
 	}
 	check_sec_ref(mod, table);
+	free_sym_table(table);
 
 	if (!mod->is_vmlinux) {
 		version = get_modinfo(&info, "version");
