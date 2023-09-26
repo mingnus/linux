@@ -268,12 +268,18 @@ static void set_len(struct leaf_node *n, int i, uint32_t len)
 
 /*----------------------------------------------------------------*/
 
-static void init_node_info(struct node_info *info, dm_block_t loc,
-			   dm_block_t lowest_key, unsigned nr_entries)
+static void init_node_info(struct node_info *info, struct dm_block *n)
 {
-	info->loc = loc;
-	info->lowest_key = lowest_key;
-	info->nr_entries = nr_entries;
+	uint64_t key;
+	struct node_ops *ops;
+	struct node_header *hdr = dm_block_data(n);
+
+	get_ops(hdr, &ops);
+
+	info->loc = dm_block_location(n);
+	ops->key_low(n, &key);
+	info->lowest_key = key;
+	info->nr_entries = le32_to_cpu(hdr->nr_entries);
 }
 
 static int bsearch(uint64_t *keys, unsigned count, uint64_t key, bool want_hi)
@@ -505,7 +511,6 @@ static void rebalance2(struct dm_transaction_manager *tm,
 		       struct dm_block *left, struct dm_block *right,
 		       struct rebalance_result *res)
 {
-	uint64_t key;
 	struct node_ops *ops;
 	struct node_header *l = dm_block_data(left);
 	struct node_header *r = dm_block_data(right);
@@ -521,24 +526,13 @@ static void rebalance2(struct dm_transaction_manager *tm,
 		dm_tm_dec(tm, dm_block_location(right));
 		res->nr_nodes = 1;
 
-		ops->key_low(left, &key);
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(key), le32_to_cpu(l->nr_entries));
-
+		init_node_info(&res->nodes[0], left);
 	} else {
 		redist2(left, right);
 		res->nr_nodes = 2;
 
-		// FIXME: move key_low call inside init_node_info
-		ops->key_low(left, &key);
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(key),
-			       le32_to_cpu(l->nr_entries));
-
-		ops->key_low(right, &key);
-		init_node_info(&res->nodes[1], dm_block_location(right),
-			       le64_to_cpu(key),
-			       le32_to_cpu(r->nr_entries));
+		init_node_info(&res->nodes[0], left);
+		init_node_info(&res->nodes[1], right);
 	}
 }
 
@@ -577,7 +571,6 @@ static void rebalance3(struct dm_transaction_manager *tm, struct dm_block *left,
 		       struct dm_block *center, struct dm_block *right,
 		       struct rebalance_result *res)
 {
-	uint64_t key;
 	struct node_ops *ops;
 	struct node_header *l = dm_block_data(left);
 	struct node_header *c = dm_block_data(center);
@@ -595,34 +588,15 @@ static void rebalance3(struct dm_transaction_manager *tm, struct dm_block *left,
 		delete_center_node(tm, left, center, right);
 		res->nr_nodes = 2;
 
-		ops->key_low(left, &key);
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(key),
-			       le32_to_cpu(l->nr_entries));
-
-		ops->key_low(right, &key);
-		init_node_info(&res->nodes[1], dm_block_location(right),
-			       le64_to_cpu(key),
-			       le32_to_cpu(r->nr_entries));
-
+		init_node_info(&res->nodes[0], left);
+		init_node_info(&res->nodes[1], right);
 	} else {
 		redist3(left, center, right);
 		res->nr_nodes = 3;
 
-		ops->key_low(left, &key);
-		init_node_info(&res->nodes[0], dm_block_location(left),
-			       le64_to_cpu(key),
-			       le32_to_cpu(l->nr_entries));
-
-		ops->key_low(center, &key);
-		init_node_info(&res->nodes[1], dm_block_location(center),
-			       le64_to_cpu(key),
-			       le32_to_cpu(c->nr_entries));
-
-		ops->key_low(right, &key);
-		init_node_info(&res->nodes[2], dm_block_location(right),
-			       le64_to_cpu(key),
-			       le32_to_cpu(r->nr_entries));
+		init_node_info(&res->nodes[0], left);
+		init_node_info(&res->nodes[1], center);
+		init_node_info(&res->nodes[2], right);
 	}
 }
 
@@ -986,9 +960,7 @@ static int internal_insert(struct insert_args *args, struct dm_block *b,
 		}
 
 		res->nr_nodes = 1;
-		init_node_info(&res->nodes[0], dm_block_location(b),
-			       le64_to_cpu(n->keys[0]),
-			       le32_to_cpu(n->header.nr_entries));
+		init_node_info(&res->nodes[0], b);
 
 		if (rebalance_outcome > 0)
 			res->stats[rebalance_outcome]++;
@@ -1000,10 +972,7 @@ static int internal_insert(struct insert_args *args, struct dm_block *b,
 			insert_into_internal(n, i + 1, res->nodes[1].lowest_key,
 					     res->nodes[1].loc);
 			res->nr_nodes = 1;
-			init_node_info(&res->nodes[0], dm_block_location(b),
-				       le64_to_cpu(n->keys[0]),
-				       le32_to_cpu(n->header.nr_entries));
-
+			init_node_info(&res->nodes[0], b);
 		} else {
 			/* split the node */
 			struct dm_block *sib;
@@ -1033,12 +1002,8 @@ static int internal_insert(struct insert_args *args, struct dm_block *b,
 					     res->nodes[1].loc);
 
 			res->nr_nodes = 2;
-			init_node_info(&res->nodes[0], dm_block_location(b),
-				       le64_to_cpu(n->keys[0]),
-				       le32_to_cpu(n->header.nr_entries));
-			init_node_info(&res->nodes[1], dm_block_location(sib),
-				       le64_to_cpu(sib_n->keys[0]),
-				       le32_to_cpu(sib_n->header.nr_entries));
+			init_node_info(&res->nodes[0], b);
+			init_node_info(&res->nodes[1], sib);
 
 			dm_tm_unlock(args->tm, sib);
 			res->action[INTERNAL_SPLIT]++;
@@ -1302,22 +1267,15 @@ static int insert_into_leaf(struct insert_args *args, struct dm_block *b,
 		leaf_insert_(n2, args->v, index);
 
 		res->nr_nodes = 2;
-		init_node_info(&res->nodes[0], dm_block_location(b),
-			       le64_to_cpu(n->keys[0]),
-			       le32_to_cpu(n->header.nr_entries));
-		init_node_info(&res->nodes[1], dm_block_location(sib),
-			       le64_to_cpu(sib_n->keys[0]),
-			       le32_to_cpu(sib_n->header.nr_entries));
-
+		init_node_info(&res->nodes[0], b);
+		init_node_info(&res->nodes[1], sib);
 		dm_tm_unlock(args->tm, sib);
 
 		res->action[LEAF_SPLIT]++;
 	} else {
 		leaf_insert_(n, args->v, index);
 		res->nr_nodes = 1;
-		init_node_info(&res->nodes[0], dm_block_location(b),
-			       le64_to_cpu(n->keys[0]),
-			       le32_to_cpu(n->header.nr_entries));
+		init_node_info(&res->nodes[0], b);
 	}
 
 	res->flags = LEAF_NODE;
@@ -1956,9 +1914,7 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 		dm_block_t node_end;
 
 		res->nr_nodes = 1;
-		init_node_info(&res->nodes[0], dm_block_location(block),
-			       le64_to_cpu(n->keys[0]),
-			       le32_to_cpu(n->header.nr_entries));
+		init_node_info(&res->nodes[0], block);
 
 		/* adjust the node_end */
 		node_end = le64_to_cpu(n->header.node_end);
@@ -1981,9 +1937,7 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 				n->header.node_end = cpu_to_le64(thin_begin);
 
 			res->nr_nodes = 1;
-			init_node_info(&res->nodes[0], dm_block_location(block),
-				       le64_to_cpu(n->keys[0]),
-				       le32_to_cpu(n->header.nr_entries));
+			init_node_info(&res->nodes[0], block);
 		} else {
 			/* split the node */
 			struct dm_block *sib;
@@ -2010,15 +1964,9 @@ static int remove_internal_(struct dm_transaction_manager *tm,
 					     new_node->loc);
 
 			// FIXME: adjust the node_end for the two nodes
-
 			res->nr_nodes = 2;
-			init_node_info(&res->nodes[0], dm_block_location(block),
-				       le64_to_cpu(n->keys[0]),
-				       le32_to_cpu(n->header.nr_entries));
-			init_node_info(&res->nodes[1], dm_block_location(sib),
-				       le64_to_cpu(sib_n->keys[0]),
-				       le32_to_cpu(sib_n->header.nr_entries));
-
+			init_node_info(&res->nodes[0], block);
+			init_node_info(&res->nodes[1], sib);
 			dm_tm_unlock(tm, sib);
 		}
 	}
@@ -2144,9 +2092,7 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 		}
 
 		res->nr_nodes = 1;
-		init_node_info(res->nodes, dm_block_location(block),
-			       le64_to_cpu(n->keys[0]),
-			       le32_to_cpu(n->header.nr_entries));
+		init_node_info(res->nodes, block);
 	}
 
 	/*
