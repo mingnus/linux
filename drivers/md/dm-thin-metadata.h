@@ -44,6 +44,7 @@ typedef uint64_t dm_thin_id;
  */
 struct dm_pool_metadata *dm_pool_metadata_open(struct block_device *bdev,
 					       sector_t data_block_size,
+					       bool use_rtree,
 					       bool format_device);
 
 int dm_pool_metadata_close(struct dm_pool_metadata *pmd);
@@ -54,7 +55,8 @@ int dm_pool_metadata_close(struct dm_pool_metadata *pmd);
  */
 #define THIN_FEATURE_COMPAT_SUPP	  0UL
 #define THIN_FEATURE_COMPAT_RO_SUPP	  0UL
-#define THIN_FEATURE_INCOMPAT_SUPP	  0UL
+#define THIN_FEATURE_INCOMPAT_SUPP	  1UL
+#define THIN_FEATURE_USE_RTREE		  1UL
 
 /*
  * Device creation/deletion.
