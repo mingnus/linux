@@ -898,32 +898,45 @@ static int rebalance(struct insert_args *args, struct internal_node *n,
 	int r;
 
 	BUG_ON(nr_entries < 2);
+	*res = NOTHING;
 
 	if (index > 0) {
-		r = get_node_free_space(args->tm, n->values[index - 1],
-					&free_space);
+		dm_block_t left_b = le64_to_cpu(n->values[index - 1]);
+		int left_shared = 0;
+
+		r = dm_tm_block_is_shared(args->tm, left_b, &left_shared);
 		if (r)
 			return r;
 
-		if (free_space > 8) {
-			rebalance2_(args, n, index - 1, res);
-			return 0;
+		if (!left_shared) {
+			r = get_node_free_space(args->tm, left_b, &free_space);
+			if (r)
+				return r;
+
+			if (free_space > 8) {
+				rebalance2_(args, n, index - 1, res);
+				return 0;
+			}
 		}
 	}
 
 	if (index < nr_entries - 1) {
-		r = get_node_free_space(args->tm, n->values[index + 1],
-					&free_space);
+		dm_block_t right_b = le64_to_cpu(n->values[index + 1]);
+		int right_shared = 0;
+
+		r = dm_tm_block_is_shared(args->tm, right_b, &right_shared);
 		if (r)
 			return r;
 
-		if (free_space > 8) {
-			rebalance2_(args, n, index, res);
-		} else {
-			*res = NOTHING;
+		if (!right_shared) {
+			r = get_node_free_space(args->tm, right_b, &free_space);
+			if (r)
+				return r;
+
+			if (free_space > 8) {
+				rebalance2_(args, n, index, res);
+			}
 		}
-	} else {
-		*res = NOTHING;
 	}
 
 	return 0;
