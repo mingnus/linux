@@ -1205,9 +1205,6 @@ int dm_pool_metadata_close(struct dm_pool_metadata *pmd)
 	if (pmd->data_extents)
 		dm_extent_allocator_destroy(pmd->data_extents);
 
-	if (pmd->data_extents)
-		dm_extent_allocator_destroy(pmd->data_extents);
-
 	kfree(pmd);
 	return 0;
 }
