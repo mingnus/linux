@@ -137,6 +137,7 @@ dm_thin_id dm_thin_dev_id(struct dm_thin_device *td);
 
 struct dm_thin_lookup_result {
 	dm_block_t block;
+	uint32_t len;
 	bool shared:1;
 };
 

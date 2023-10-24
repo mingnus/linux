@@ -152,6 +152,7 @@ struct bottom_level_operations {
 	int (*create)(void *, dm_block_t *);
 	int (*insert)(void *, dm_block_t, dm_block_t, dm_block_t *, int *);
 	int (*delete)(void *, dm_block_t);
+	int (*lookup)(void *, dm_block_t, int, struct dm_thin_lookup_result *);
 	int (*remove_range)(void *, dm_block_t, dm_block_t, dm_block_t *,
 			    dm_block_t *);
 };
@@ -183,6 +184,11 @@ struct dm_pool_metadata {
 	 * Just the top level for deleting whole devices.
 	 */
 	struct dm_btree_info tl_info;
+
+	/*
+	 * Non-blocking version of the above.
+	 */
+	struct dm_btree_info nb_tl_info;
 
 	/*
 	 * Just the bottom level for creating new devices.
@@ -431,6 +437,8 @@ static int subtree_equal(void *context, const void *value1_le, const void *value
 
 /*----------------------------------------------------------------*/
 
+static bool __snapshotted_since(struct dm_thin_device *td, uint32_t time);
+
 static int rtree_create(void *context, dm_block_t *root)
 {
 	struct dm_pool_metadata *pmd = context;
@@ -451,6 +459,43 @@ static int rtree_insert(void *context, dm_block_t block, dm_block_t data_block,
 
 	return dm_rtree_insert(pmd->tm, pmd->data_sm, *root, &mapping, root,
 			       inserted);
+}
+
+static int rtree_lookup(void *context, dm_block_t block,
+			int can_issue_io, struct dm_thin_lookup_result *result)
+{
+	struct dm_thin_device *td = context;
+	struct dm_pool_metadata *pmd = td->pmd;
+	__le64 value;
+	dm_block_t mapping_root;
+	struct dm_transaction_manager *tm;
+	struct dm_btree_info *tl_info;
+	struct dm_mapping bl_result;
+	int r = 0;
+
+	if (can_issue_io) {
+		tl_info = &pmd->tl_info;
+		tm = pmd->tm;
+	} else {
+		tl_info = &pmd->nb_tl_info;
+		tm = pmd->nb_tm;
+	}
+
+	r = dm_btree_lookup(tl_info, pmd->root, &td->id, &value);
+	if (r)
+		return r;
+
+	mapping_root = le64_to_cpu(value);
+	r = dm_rtree_lookup(tm, mapping_root, block, &bl_result);
+
+	if (!r) {
+		uint64_t offset = block - bl_result.thin_begin;
+		result->block = bl_result.data_begin + offset;
+		result->len = bl_result.len - offset;
+		result->shared = __snapshotted_since(td, bl_result.time);
+	}
+
+	return r;
 }
 
 static int rtree_delete(void *context, dm_block_t root)
@@ -495,6 +540,28 @@ static int btree_delete(void *context, dm_block_t root)
 {
 	struct dm_pool_metadata *pmd = context;
 	return dm_btree_del(&pmd->bl_info, root);
+}
+
+static int btree_lookup(void *context, dm_block_t block,
+			int can_issue_io, struct dm_thin_lookup_result *result)
+{
+	struct dm_thin_device *td = context;
+	struct dm_pool_metadata *pmd = td->pmd;
+	dm_block_t keys[2] = { td->id, block };
+	struct dm_btree_info *info;
+	__le64 value;
+	int r;
+
+	if (can_issue_io)
+		info = &pmd->info;
+	else
+		info = &pmd->nb_info;
+
+	r = dm_btree_lookup(info, pmd->root, keys, &value);
+	if (!r)
+		unpack_lookup_result(td, value, result);
+
+	return r;
 }
 
 static int btree_remove_range(void *context, dm_block_t begin, dm_block_t end,
@@ -625,6 +692,9 @@ static void __setup_btree_details(struct dm_pool_metadata *pmd)
 	pmd->tl_info.value_type.dec = subtree_dec;
 	pmd->tl_info.value_type.equal = subtree_equal;
 
+	memcpy(&pmd->nb_tl_info, &pmd->tl_info, sizeof(pmd->nb_tl_info));
+	pmd->nb_tl_info.tm = pmd->nb_tm;
+
 	pmd->bl_info.tm = pmd->tm;
 	pmd->bl_info.levels = 1;
 	pmd->bl_info.value_type.context = pmd->data_sm;
@@ -645,11 +715,13 @@ static void __setup_btree_details(struct dm_pool_metadata *pmd)
 		pmd->bl_ops.create = rtree_create;
 		pmd->bl_ops.insert = rtree_insert;
 		pmd->bl_ops.delete = rtree_delete;
+		pmd->bl_ops.lookup = rtree_lookup;
 		pmd->bl_ops.remove_range = rtree_remove_range;
 	} else {
 		pmd->bl_ops.create = btree_create;
 		pmd->bl_ops.insert = btree_insert;
 		pmd->bl_ops.delete = btree_delete;
+		pmd->bl_ops.lookup = btree_lookup;
 		pmd->bl_ops.remove_range = btree_remove_range;
 	}
 }
@@ -1723,28 +1795,15 @@ static void unpack_lookup_result(struct dm_thin_device *td, __le64 value,
 	block_time = le64_to_cpu(value);
 	unpack_block_time(block_time, &exception_block, &exception_time);
 	result->block = exception_block;
+	result->len = 1;
 	result->shared = __snapshotted_since(td, exception_time);
 }
 
 static int __find_block(struct dm_thin_device *td, dm_block_t block,
 			int can_issue_io, struct dm_thin_lookup_result *result)
 {
-	int r;
-	__le64 value;
 	struct dm_pool_metadata *pmd = td->pmd;
-	dm_block_t keys[2] = { td->id, block };
-	struct dm_btree_info *info;
-
-	if (can_issue_io)
-		info = &pmd->info;
-	else
-		info = &pmd->nb_info;
-
-	r = dm_btree_lookup(info, pmd->root, keys, &value);
-	if (!r)
-		unpack_lookup_result(td, value, result);
-
-	return r;
+	return pmd->bl_ops.lookup(td, block, can_issue_io, result);
 }
 
 int dm_thin_find_block(struct dm_thin_device *td, dm_block_t block,
