@@ -153,6 +153,7 @@ struct bottom_level_operations {
 	int (*insert)(void *, dm_block_t, dm_block_t, dm_block_t *, int *);
 	int (*delete)(void *, dm_block_t);
 	int (*lookup)(void *, dm_block_t, int, struct dm_thin_lookup_result *);
+	int (*lookup_next)(void *, dm_block_t, dm_block_t *, struct dm_thin_lookup_result *);
 	int (*remove_range)(void *, dm_block_t, dm_block_t, dm_block_t *,
 			    dm_block_t *);
 };
@@ -498,6 +499,39 @@ static int rtree_lookup(void *context, dm_block_t block,
 	return r;
 }
 
+static int rtree_lookup_next(void *context, dm_block_t block,
+			     dm_block_t *vblock,
+			     struct dm_thin_lookup_result *result)
+{
+	struct dm_thin_device *td = context;
+	struct dm_pool_metadata *pmd = td->pmd;
+	struct dm_mapping bl_result;
+	dm_block_t mapping_root;
+	__le64 value;
+	int r;
+
+	r = dm_btree_lookup(&pmd->tl_info, pmd->root, &td->id, &value);
+	if (r)
+		return r;
+
+	mapping_root = le64_to_cpu(value);
+	r = dm_rtree_lookup_next(pmd->tm, mapping_root, block, &bl_result);
+
+	if (!r) {
+		if (block > bl_result.thin_begin) {
+			uint64_t offset = block - bl_result.thin_begin;
+			result->block = bl_result.data_begin + offset;
+			result->len = bl_result.len - offset;
+		} else {
+			result->block = bl_result.data_begin;
+			result->len = bl_result.len;
+		}
+		result->shared = __snapshotted_since(td, bl_result.time);
+	}
+
+	return r;
+}
+
 static int rtree_delete(void *context, dm_block_t root)
 {
 	struct dm_pool_metadata *pmd = context;
@@ -558,6 +592,23 @@ static int btree_lookup(void *context, dm_block_t block,
 		info = &pmd->nb_info;
 
 	r = dm_btree_lookup(info, pmd->root, keys, &value);
+	if (!r)
+		unpack_lookup_result(td, value, result);
+
+	return r;
+}
+
+static int btree_lookup_next(void *context, dm_block_t block,
+			     dm_block_t *vblock,
+			     struct dm_thin_lookup_result *result)
+{
+	struct dm_thin_device *td = context;
+	struct dm_pool_metadata *pmd = td->pmd;
+	int r;
+	__le64 value;
+	dm_block_t keys[2] = { td->id, block };
+
+	r = dm_btree_lookup_next(&pmd->info, pmd->root, keys, vblock, &value);
 	if (!r)
 		unpack_lookup_result(td, value, result);
 
@@ -716,12 +767,14 @@ static void __setup_btree_details(struct dm_pool_metadata *pmd)
 		pmd->bl_ops.insert = rtree_insert;
 		pmd->bl_ops.delete = rtree_delete;
 		pmd->bl_ops.lookup = rtree_lookup;
+		pmd->bl_ops.lookup_next = rtree_lookup_next;
 		pmd->bl_ops.remove_range = rtree_remove_range;
 	} else {
 		pmd->bl_ops.create = btree_create;
 		pmd->bl_ops.insert = btree_insert;
 		pmd->bl_ops.delete = btree_delete;
 		pmd->bl_ops.lookup = btree_lookup;
+		pmd->bl_ops.lookup_next = btree_lookup_next;
 		pmd->bl_ops.remove_range = btree_remove_range;
 	}
 }
@@ -1828,16 +1881,8 @@ static int __find_next_mapped_block(struct dm_thin_device *td, dm_block_t block,
 					  dm_block_t *vblock,
 					  struct dm_thin_lookup_result *result)
 {
-	int r;
-	__le64 value;
 	struct dm_pool_metadata *pmd = td->pmd;
-	dm_block_t keys[2] = { td->id, block };
-
-	r = dm_btree_lookup_next(&pmd->info, pmd->root, keys, vblock, &value);
-	if (!r)
-		unpack_lookup_result(td, value, result);
-
-	return r;
+	return pmd->bl_ops.lookup_next(td, block, vblock, result);
 }
 
 static int __find_mapped_range(struct dm_thin_device *td,
@@ -1848,6 +1893,7 @@ static int __find_mapped_range(struct dm_thin_device *td,
 	int r;
 	dm_block_t pool_end;
 	struct dm_thin_lookup_result lookup;
+	uint64_t mapped_len;
 
 	if (end < begin)
 		return -ENODATA;
@@ -1863,8 +1909,9 @@ static int __find_mapped_range(struct dm_thin_device *td,
 	*pool_begin = lookup.block;
 	*maybe_shared = lookup.shared;
 
-	begin++;
-	pool_end = *pool_begin + 1;
+	mapped_len = min((uint64_t)lookup.len, end - begin);
+	begin += mapped_len;
+	pool_end = *pool_begin + mapped_len;
 	while (begin != end) {
 		r = __find_block(td, begin, true, &lookup);
 		if (r) {
@@ -1878,8 +1925,9 @@ static int __find_mapped_range(struct dm_thin_device *td,
 		    (lookup.shared != *maybe_shared))
 			break;
 
-		pool_end++;
-		begin++;
+		mapped_len = min((uint64_t)lookup.len, end - begin);
+		begin += mapped_len;
+		pool_end += mapped_len;
 	}
 
 	*thin_end = begin;
