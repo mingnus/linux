@@ -1749,6 +1749,65 @@ EXPORT_SYMBOL_GPL(dm_rtree_lookup);
 
 /*----------------------------------------------------------------*/
 
+int dm_rtree_lookup_next(struct dm_transaction_manager *tm, dm_block_t root,
+			 dm_block_t key, struct dm_mapping *result)
+{
+	int r, i;
+	struct dm_block *b;
+	uint32_t flags, nr_entries;
+	struct node_header *h;
+	struct internal_node *n;
+
+	r = dm_tm_read_lock(tm, root, &validator, &b);
+	if (r < 0)
+		return r;
+
+	h = dm_block_data(b);
+	flags = le32_to_cpu(h->flags);
+	nr_entries = le32_to_cpu(h->nr_entries);
+
+	n = (struct internal_node *)h;
+	i = lower_bound(n->keys, nr_entries, key);
+
+	if (i >= nr_entries) {
+		r = -ENODATA;
+		goto out;
+	}
+
+	if (i < 0) {
+		i = 0;
+	}
+
+	if (flags & INTERNAL_NODE) {
+		r = dm_rtree_lookup_next(tm, le64_to_cpu(n->values[i]), key, result);
+		if (r == -ENODATA && i < (nr_entries - 1)) {
+			i++;
+			r = dm_rtree_lookup_next(tm, le64_to_cpu(n->values[i]), key, result);
+		}
+
+	} else {
+		struct leaf_node *n = (struct leaf_node *)h;
+		get_mapping(n, i, result);
+
+		while (key > result->thin_begin &&
+		       key - result->thin_begin >= result->len) {
+			i++;
+			if (i >= nr_entries) {
+				r = -ENODATA;
+				goto out;
+			}
+			get_mapping(n, i, result);
+		}
+	}
+out:
+	dm_tm_unlock(tm, b);
+	return r;
+}
+
+EXPORT_SYMBOL_GPL(dm_rtree_lookup_next);
+
+/*----------------------------------------------------------------*/
+
 /*
  * Returns the number of spare entries in a node.
  */
