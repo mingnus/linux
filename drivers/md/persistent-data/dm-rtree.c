@@ -2316,10 +2316,76 @@ int dm_rtree_remove(struct dm_transaction_manager *tm,
 
 EXPORT_SYMBOL_GPL(dm_rtree_remove);
 
+/*----------------------------------------------------------------*/
+
+static int find_key(struct dm_transaction_manager *tm, dm_block_t block,
+		    bool find_highest, uint64_t *result_key)
+{
+	int i, r;
+	uint32_t flags;
+	struct dm_block *b;
+	struct node_header *h;
+
+	do {
+		r = dm_tm_read_lock(tm, block, &validator, &b);
+		if (r < 0)
+			return r;
+
+		h = dm_block_data(b);
+		flags = le32_to_cpu(h->flags);
+		i = le32_to_cpu(h->nr_entries);
+		if (!i) {
+			dm_tm_unlock(tm, b);
+			return -ENODATA;
+		}
+
+		i--;
+
+		if (flags & INTERNAL_NODE) {
+			struct internal_node *n = (struct internal_node *)h;
+			if (find_highest)
+				block = le64_to_cpu(n->values[i]);
+			else
+				block = le64_to_cpu(n->values[0]);
+		} else {
+			struct leaf_node *n = (struct leaf_node *)h;
+			struct dm_mapping m;
+
+			if (find_highest) {
+				get_mapping(n, i, &m);
+				*result_key = m.thin_begin + m.len - 1;
+			} else {
+				get_mapping(n, 0, &m);
+				*result_key = m.thin_begin;
+			}
+		}
+
+		dm_tm_unlock(tm, b);
+	} while (flags & INTERNAL_NODE);
+
+	return 0;
+}
+
+/*
+ * Returns 1 if the output is valid.
+ * Returns 0 if the tree is empty.
+ * Returns negative number on error.
+ */
+static int dm_rtree_find_key(struct dm_transaction_manager *tm, dm_block_t root,
+			     bool find_highest, uint64_t *result_key)
+{
+	int r;
+	r = find_key(tm, root, find_highest, result_key);
+	if (r == -ENODATA) {
+		return 0;
+	}
+	return r ? r : 1;
+}
+
 int dm_rtree_find_highest_key(struct dm_transaction_manager *tm,
 			      dm_block_t root, dm_block_t *thin_block_result)
 {
-	return -EINVAL;
+	return dm_rtree_find_key(tm, root, true, thin_block_result);
 }
 
 EXPORT_SYMBOL_GPL(dm_rtree_find_highest_key);
