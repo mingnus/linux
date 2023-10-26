@@ -456,7 +456,7 @@ static int rtree_insert(void *context, dm_block_t block, dm_block_t data_block,
 	mapping.data_begin = data_block;
 	mapping.len = 1;
 	mapping.time = pmd->time;
-	*inserted = 0;		// TODO: stub
+	*inserted = 0;
 
 	return dm_rtree_insert(pmd->tm, pmd->data_sm, *root, &mapping, root,
 			       inserted);

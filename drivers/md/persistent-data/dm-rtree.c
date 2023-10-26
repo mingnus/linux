@@ -89,6 +89,7 @@ struct insert_result {
 	unsigned nr_nodes;
 	struct node_info nodes[2];
 	unsigned flags;
+	unsigned nr_inserts;
 
 	// counters
 	unsigned action[8];
@@ -1518,7 +1519,10 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 	int action = 0;
 	struct dm_space_map *data_sm;
 
+	res->nr_inserts = 0;
+
 	if (nr_entries == 0) {
+		res->nr_inserts = 1;
 		return insert_into_leaf(args, b, 0, res);
 	}
 	// FIXME: would this be better named 'index'
@@ -1579,6 +1583,7 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 
 	switch (action) {
 	case PUSH_BACK:
+		res->nr_inserts = 1;
 		set_len(n, i, center.len + 1, NULL);
 		break;
 	case PUSH_BACK_REPLACED:
@@ -1590,6 +1595,7 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 		set_len(n, i - 1, left.len + 1, NULL);
 		break;
 	case PUSH_FRONT:
+		res->nr_inserts = 1;
 		truncate_front(n, i + 1, right.len + 1, NULL);
 		break;
 	case PUSH_FRONT_REPLACED:
@@ -1601,6 +1607,7 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 		truncate_front(n, i + 1, right.len + 1, NULL);
 		break;
 	case MERGE:
+		res->nr_inserts = 1;
 		erase_from_leaf(n, i + 1, NULL);
 		set_len(n, i, center.len + right.len + 1, NULL);
 		break;
@@ -1621,6 +1628,7 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 		erase_from_leaf(n, i, data_sm);	// FIXME: do not erase to avoid memmove
 		return insert_into_leaf(args, b, i, res);
 	case INSERT_NEW:
+		res->nr_inserts = 1;
 		return insert_into_leaf(args, b, i + 1, res);
 	case SPLIT:
 		return overwrite_middle(args, data_sm, b, i, res);
@@ -1870,6 +1878,9 @@ int dm_rtree_insert(struct dm_transaction_manager *tm,
 		*new_root = dm_block_location(b);
 		dm_tm_unlock(tm, b);
 	}
+
+	if (nr_inserts)
+		*nr_inserts = res.nr_inserts;
 
 	/*for (i = 1; i <= 6; i++) {
 	   if (res.action[i] > 0)
