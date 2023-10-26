@@ -154,6 +154,7 @@ struct bottom_level_operations {
 	int (*delete)(void *, dm_block_t);
 	int (*lookup)(void *, dm_block_t, int, struct dm_thin_lookup_result *);
 	int (*lookup_next)(void *, dm_block_t, dm_block_t *, struct dm_thin_lookup_result *);
+	int (*find_highest_key)(void *, dm_block_t, dm_block_t *);
 	int (*remove_range)(void *, dm_block_t, dm_block_t, dm_block_t *,
 			    dm_block_t *);
 };
@@ -532,6 +533,12 @@ static int rtree_lookup_next(void *context, dm_block_t block,
 	return r;
 }
 
+static int rtree_find_highest_key(void *context, dm_block_t root, dm_block_t *result)
+{
+	struct dm_pool_metadata *pmd = context;
+	return dm_rtree_find_highest_key(pmd->tm, root, result);
+}
+
 static int rtree_delete(void *context, dm_block_t root)
 {
 	struct dm_pool_metadata *pmd = context;
@@ -613,6 +620,12 @@ static int btree_lookup_next(void *context, dm_block_t block,
 		unpack_lookup_result(td, value, result);
 
 	return r;
+}
+
+static int btree_find_highest_key(void *context, dm_block_t root, dm_block_t *result)
+{
+	struct dm_pool_metadata *pmd = context;
+	return dm_btree_find_highest_key(&pmd->bl_info, root, result);
 }
 
 static int btree_remove_range(void *context, dm_block_t begin, dm_block_t end,
@@ -768,6 +781,7 @@ static void __setup_btree_details(struct dm_pool_metadata *pmd)
 		pmd->bl_ops.delete = rtree_delete;
 		pmd->bl_ops.lookup = rtree_lookup;
 		pmd->bl_ops.lookup_next = rtree_lookup_next;
+		pmd->bl_ops.find_highest_key = rtree_find_highest_key;
 		pmd->bl_ops.remove_range = rtree_remove_range;
 	} else {
 		pmd->bl_ops.create = btree_create;
@@ -775,6 +789,7 @@ static void __setup_btree_details(struct dm_pool_metadata *pmd)
 		pmd->bl_ops.delete = btree_delete;
 		pmd->bl_ops.lookup = btree_lookup;
 		pmd->bl_ops.lookup_next = btree_lookup_next;
+		pmd->bl_ops.find_highest_key = btree_find_highest_key;
 		pmd->bl_ops.remove_range = btree_remove_range;
 	}
 }
@@ -2318,12 +2333,9 @@ int dm_thin_get_mapped_count(struct dm_thin_device *td, dm_block_t *result)
 	return r;
 }
 
-// FIXME: finish
 static int __highest_block(struct dm_thin_device *td, dm_block_t *result)
 {
-	*result = 0;
-	return 0;
-	/*int r;
+	int r;
 	__le64 value_le;
 	dm_block_t thin_root;
 	struct dm_pool_metadata *pmd = td->pmd;
@@ -2334,7 +2346,7 @@ static int __highest_block(struct dm_thin_device *td, dm_block_t *result)
 
 	thin_root = le64_to_cpu(value_le);
 
-	return dm_btree_find_highest_key(&pmd->bl_info, thin_root, result);*/
+	return pmd->bl_ops.find_highest_key(pmd, thin_root, result);
 }
 
 int dm_thin_get_highest_mapped_block(struct dm_thin_device *td,
