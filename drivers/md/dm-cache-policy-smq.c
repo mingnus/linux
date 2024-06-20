@@ -1052,9 +1052,9 @@ static void update_promote_levels(struct smq_policy *mq)
 	 * eager to promote.
 	 */
 	unsigned int threshold_level = allocator_empty(&mq->cache_alloc) ?
-		default_promote_level(mq) : (NR_HOTSPOT_LEVELS / 2u);
+		default_promote_level(mq) : (mq->hotspot.nr_levels / 2u);
 
-	threshold_level = max(threshold_level, NR_HOTSPOT_LEVELS);
+	threshold_level = max(threshold_level, mq->hotspot.nr_levels);
 
 	/*
 	 * If the hotspot queue is performing badly then we have little
@@ -1074,8 +1074,8 @@ static void update_promote_levels(struct smq_policy *mq)
 		break;
 	}
 
-	mq->read_promote_level = NR_HOTSPOT_LEVELS - threshold_level;
-	mq->write_promote_level = (NR_HOTSPOT_LEVELS - threshold_level);
+	mq->read_promote_level = mq->hotspot.nr_levels - threshold_level;
+	mq->write_promote_level = mq->hotspot.nr_levels - threshold_level;
 }
 
 /*
@@ -1102,7 +1102,9 @@ static void update_level_jump(struct smq_policy *mq)
 static void end_hotspot_period(struct smq_policy *mq)
 {
 	clear_bitset(mq->hotspot_hit_bits, mq->nr_hotspot_blocks);
-	update_promote_levels(mq);
+
+	if (mq->hotspot.nr_levels > 1)
+		update_promote_levels(mq);
 
 	if (time_after(jiffies, mq->next_hotspot_period)) {
 		update_level_jump(mq);
@@ -1730,13 +1732,17 @@ static void calc_hotspot_params(sector_t origin_size,
 
 static struct dm_cache_policy *
 __smq_create(dm_cblock_t cache_size, sector_t origin_size, sector_t cache_block_size,
-	     bool mimic_mq, bool migrations_allowed, bool cleaner)
+	     bool mimic_mq, bool migrations_allowed, bool cleaner, unsigned int nr_hotspot_levels)
 {
 	unsigned int i;
 	unsigned int nr_sentinels_per_queue = 2u * NR_CACHE_LEVELS;
 	unsigned int total_sentinels = 2u * nr_sentinels_per_queue;
-	struct smq_policy *mq = kzalloc(sizeof(*mq), GFP_KERNEL);
+	struct smq_policy *mq;
 
+	if (!nr_hotspot_levels)
+		return NULL;
+
+	mq = kzalloc(sizeof(*mq), GFP_KERNEL);
 	if (!mq)
 		return NULL;
 
@@ -1789,15 +1795,15 @@ __smq_create(dm_cblock_t cache_size, sector_t origin_size, sector_t cache_block_
 	mq->tick = 0;
 	spin_lock_init(&mq->lock);
 
-	q_init(&mq->hotspot, &mq->es, NR_HOTSPOT_LEVELS);
-	mq->hotspot.nr_top_levels = 8;
-	mq->hotspot.nr_in_top_levels = min(mq->nr_hotspot_blocks / NR_HOTSPOT_LEVELS,
+	q_init(&mq->hotspot, &mq->es, nr_hotspot_levels);
+	mq->hotspot.nr_top_levels = min(nr_hotspot_levels, 8);
+	mq->hotspot.nr_in_top_levels = min(mq->nr_hotspot_blocks / nr_hotspot_levels,
 					   from_cblock(mq->cache_size) / mq->cache_blocks_per_hotspot_block);
 
 	q_init(&mq->clean, &mq->es, NR_CACHE_LEVELS);
 	q_init(&mq->dirty, &mq->es, NR_CACHE_LEVELS);
 
-	stats_init(&mq->hotspot_stats, NR_HOTSPOT_LEVELS);
+	stats_init(&mq->hotspot_stats, nr_hotspot_levels);
 	stats_init(&mq->cache_stats, NR_CACHE_LEVELS);
 
 	if (h_init(&mq->table, &mq->es, from_cblock(cache_size)))
@@ -1807,7 +1813,7 @@ __smq_create(dm_cblock_t cache_size, sector_t origin_size, sector_t cache_block_
 		goto bad_alloc_hotspot_table;
 
 	sentinels_init(mq);
-	mq->write_promote_level = mq->read_promote_level = NR_HOTSPOT_LEVELS;
+	mq->write_promote_level = mq->read_promote_level = nr_hotspot_levels - 1;
 
 	mq->next_hotspot_period = jiffies;
 	mq->next_cache_period = jiffies;
@@ -1842,7 +1848,7 @@ static struct dm_cache_policy *smq_create(dm_cblock_t cache_size,
 					  sector_t cache_block_size)
 {
 	return __smq_create(cache_size, origin_size, cache_block_size,
-			    false, true, false);
+			    false, true, false, NR_HOTSPOT_LEVELS);
 }
 
 static struct dm_cache_policy *mq_create(dm_cblock_t cache_size,
@@ -1850,7 +1856,15 @@ static struct dm_cache_policy *mq_create(dm_cblock_t cache_size,
 					 sector_t cache_block_size)
 {
 	return __smq_create(cache_size, origin_size, cache_block_size,
-			    true, true, false);
+			    true, true, false, NR_HOTSPOT_LEVELS);
+}
+
+static struct dm_cache_policy *lru_create(dm_cblock_t cache_size,
+					      sector_t origin_size,
+					      sector_t cache_block_size)
+{
+	return __smq_create(cache_size, origin_size, cache_block_size,
+			    false, true, true, 1);
 }
 
 static struct dm_cache_policy *cleaner_create(dm_cblock_t cache_size,
@@ -1858,7 +1872,7 @@ static struct dm_cache_policy *cleaner_create(dm_cblock_t cache_size,
 					      sector_t cache_block_size)
 {
 	return __smq_create(cache_size, origin_size, cache_block_size,
-			    false, false, true);
+			    false, false, true, NR_HOTSPOT_LEVELS);
 }
 
 /*----------------------------------------------------------------*/
@@ -1877,6 +1891,14 @@ static struct dm_cache_policy_type mq_policy_type = {
 	.hint_size = 4,
 	.owner = THIS_MODULE,
 	.create = mq_create,
+};
+
+static struct dm_cache_policy_type lru_policy_type = {
+	.name = "lru",
+	.version = {2, 0, 0},
+	.hint_size = 4,
+	.owner = THIS_MODULE,
+	.create = lru_create,
 };
 
 static struct dm_cache_policy_type cleaner_policy_type = {
@@ -1912,6 +1934,12 @@ static int __init smq_init(void)
 		goto out_mq;
 	}
 
+	r = dm_cache_policy_register(&lru_policy_type);
+	if (r) {
+		DMERR("register failed (as lru) %d", r);
+		goto out_lru;
+	}
+
 	r = dm_cache_policy_register(&cleaner_policy_type);
 	if (r) {
 		DMERR("register failed (as cleaner) %d", r);
@@ -1929,6 +1957,8 @@ static int __init smq_init(void)
 out_default:
 	dm_cache_policy_unregister(&cleaner_policy_type);
 out_cleaner:
+	dm_cache_policy_unregister(&lru_policy_type);
+out_lru:
 	dm_cache_policy_unregister(&mq_policy_type);
 out_mq:
 	dm_cache_policy_unregister(&smq_policy_type);
@@ -1941,6 +1971,7 @@ static void __exit smq_exit(void)
 	dm_cache_policy_unregister(&cleaner_policy_type);
 	dm_cache_policy_unregister(&smq_policy_type);
 	dm_cache_policy_unregister(&mq_policy_type);
+	dm_cache_policy_unregister(&lru_policy_type);
 	dm_cache_policy_unregister(&default_policy_type);
 }
 
