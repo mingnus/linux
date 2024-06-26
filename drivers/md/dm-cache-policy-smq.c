@@ -864,6 +864,11 @@ struct smq_policy {
 	 * even if the device is not idle.
 	 */
 	bool cleaner:1;
+
+	/*
+	 * If this is set the policy will try populate the cache more aggressively
+	 */
+	bool fast_populate:1;
 };
 
 /*----------------------------------------------------------------*/
@@ -1017,44 +1022,9 @@ static void requeue(struct smq_policy *mq, struct entry *e)
 	}
 }
 
-static unsigned int default_promote_level(struct smq_policy *mq)
+static unsigned int weighted_promote_level(struct smq_policy *mq)
 {
-	/*
-	 * The promote level depends on the current performance of the
-	 * cache.
-	 *
-	 * If the cache is performing badly, then we can't afford
-	 * to promote much without causing performance to drop below that
-	 * of the origin device.
-	 *
-	 * If the cache is performing well, then we don't need to promote
-	 * much.  If it isn't broken, don't fix it.
-	 *
-	 * If the cache is middling then we promote more.
-	 *
-	 * This scheme reminds me of a graph of entropy vs probability of a
-	 * binary variable.
-	 */
-	static const unsigned int table[] = {
-		1, 1, 1, 2, 4, 6, 7, 8, 7, 6, 4, 4, 3, 3, 2, 2, 1
-	};
-
-	unsigned int hits = mq->cache_stats.hits;
-	unsigned int misses = mq->cache_stats.misses;
-	unsigned int index = safe_div(hits << 4u, hits + misses);
-	return table[index];
-}
-
-static void update_promote_levels(struct smq_policy *mq)
-{
-	/*
-	 * If there are unused cache entries then we want to be really
-	 * eager to promote.
-	 */
-	unsigned int threshold_level = allocator_empty(&mq->cache_alloc) ?
-		default_promote_level(mq) : (NR_HOTSPOT_LEVELS / 2u);
-
-	threshold_level = max(threshold_level, NR_HOTSPOT_LEVELS);
+	unsigned int threshold_level = NR_HOTSPOT_LEVELS;
 
 	/*
 	 * If the hotspot queue is performing badly then we have little
@@ -1074,8 +1044,18 @@ static void update_promote_levels(struct smq_policy *mq)
 		break;
 	}
 
-	mq->read_promote_level = NR_HOTSPOT_LEVELS - threshold_level;
-	mq->write_promote_level = (NR_HOTSPOT_LEVELS - threshold_level);
+	return NR_HOTSPOT_LEVELS - threshold_level;
+}
+
+static void update_promote_levels(struct smq_policy *mq)
+{
+	bool cache_empty = allocator_empty(&mq->cache_alloc);
+
+	unsigned int level = (mq->fast_populate && !cache_empty) ?
+		0 : weighted_promote_level(mq);
+
+	mq->read_promote_level = level;
+	mq->write_promote_level = level;
 }
 
 /*
@@ -1644,6 +1624,35 @@ static void smq_allow_migrations(struct dm_cache_policy *p, bool allow)
 	mq->migrations_allowed = allow;
 }
 
+static int smq_set_config_value(struct dm_cache_policy *p,
+				const char *key, const char *value)
+{
+	struct smq_policy *mq = to_smq_policy(p);
+	unsigned long tmp;
+
+	if (kstrtoul(value, 10, &tmp))
+		return -EINVAL;
+
+	if (!strcasecmp(key, "fast_populate")) {
+		mq->fast_populate = (tmp != 0);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int smq_emit_config_values(struct dm_cache_policy *p, char *result,
+				  unsigned int maxlen, ssize_t *sz_ptr)
+{
+	struct smq_policy *mq = to_smq_policy(p);
+	ssize_t sz = *sz_ptr;
+
+	DMEMIT("2 fast_populate %u ", mq->fast_populate ? 1 : 0);
+
+	*sz_ptr = sz;
+	return 0;
+}
+
 /*
  * smq has no config values, but the old mq policy did.  To avoid breaking
  * software we continue to accept these configurables for the mq policy,
@@ -1704,6 +1713,9 @@ static void init_policy_functions(struct smq_policy *mq, bool mimic_mq)
 	if (mimic_mq) {
 		mq->policy.set_config_value = mq_set_config_value;
 		mq->policy.emit_config_values = mq_emit_config_values;
+	} else {
+		mq->policy.set_config_value = smq_set_config_value;
+		mq->policy.emit_config_values = smq_emit_config_values;
 	}
 }
 
@@ -1818,6 +1830,7 @@ __smq_create(dm_cblock_t cache_size, sector_t origin_size, sector_t cache_block_
 
 	mq->migrations_allowed = migrations_allowed;
 	mq->cleaner = cleaner;
+	mq->fast_populate = false;
 
 	return &mq->policy;
 
