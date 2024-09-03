@@ -54,6 +54,7 @@ struct dm_space_map {
 	 * new_block will increment the returned block.
 	 */
 	int (*new_block)(struct dm_space_map *sm, dm_block_t *b);
+	int (*new_block_in_range)(struct dm_space_map *sm, dm_block_t b, dm_block_t e, dm_block_t *result);
 
 	/*
 	 * The root contains all the information needed to fix the space map.
@@ -71,6 +72,14 @@ struct dm_space_map {
 					   dm_block_t threshold,
 					   dm_sm_threshold_fn fn,
 					   void *context);
+
+	/*
+	 * Find the next run of free blocks in within the given range.
+	 * We don't allocate the blocks here, just report the free run.
+	 */
+	int (*next_free_run)(struct dm_space_map *sm, dm_block_t b,
+			     dm_block_t e, dm_block_t *result_b,
+			     dm_block_t *result_e);
 };
 
 /*----------------------------------------------------------------*/
@@ -144,6 +153,13 @@ static inline int dm_sm_new_block(struct dm_space_map *sm, dm_block_t *b)
 	return sm->new_block(sm, b);
 }
 
+static inline int dm_sm_new_block_in_range(struct dm_space_map *sm,
+					   dm_block_t b, dm_block_t e,
+					   dm_block_t *result)
+{
+	return sm->new_block_in_range(sm, b, e, result);
+}
+
 static inline int dm_sm_root_size(struct dm_space_map *sm, size_t *result)
 {
 	return sm->root_size(sm, result);
@@ -152,6 +168,17 @@ static inline int dm_sm_root_size(struct dm_space_map *sm, size_t *result)
 static inline int dm_sm_copy_root(struct dm_space_map *sm, void *copy_to_here_le, size_t len)
 {
 	return sm->copy_root(sm, copy_to_here_le, len);
+}
+
+static inline int dm_sm_next_free_run(struct dm_space_map *sm, dm_block_t begin,
+				      dm_block_t end, dm_block_t *result_begin,
+				      dm_block_t *result_end)
+{
+	if (sm->next_free_run) {
+		return sm->next_free_run(sm, begin, end, result_begin,
+					 result_end);
+	}
+	return -EINVAL;
 }
 
 static inline int dm_sm_register_threshold_callback(struct dm_space_map *sm,
@@ -164,6 +191,5 @@ static inline int dm_sm_register_threshold_callback(struct dm_space_map *sm,
 
 	return -EINVAL;
 }
-
 
 #endif	/* _LINUX_DM_SPACE_MAP_H */

@@ -1550,12 +1550,13 @@ static int alloc_data_block(struct thin_c *tc, dm_block_t *result)
 		}
 	}
 
-	r = dm_pool_alloc_data_block(pool->pmd, result);
+	r = dm_thin_alloc_data_block(tc->td, result);
 	if (r) {
 		if (r == -ENOSPC)
 			set_pool_mode(pool, PM_OUT_OF_DATA_SPACE);
 		else
-			metadata_operation_failed(pool, "dm_pool_alloc_data_block", r);
+			metadata_operation_failed(
+				pool, "dm_thin_alloc_data_block", r);
 		return r;
 	}
 
@@ -3832,6 +3833,54 @@ static int process_release_metadata_snap_mesg(unsigned int argc, char **argv, st
 	return r;
 }
 
+static int process_trim(unsigned int argc, char **argv, struct pool *pool)
+{
+	int r;
+	dm_block_t begin, end;
+
+	r = check_arg_count(argc, 3);
+	if (r)
+		return r;
+
+	/* parse args */
+	if (kstrtoull(argv[1], 10, (unsigned long long *)&begin)) {
+		DMWARN("trim message: bad begin '%s'", argv[1]);
+		return -EINVAL;
+	}
+
+	if (kstrtoull(argv[1], 10, (unsigned long long *)&end)) {
+		DMWARN("trim message: bad begin '%s'", argv[1]);
+		return -EINVAL;
+	}
+
+	// lock region in allocators
+	r = dm_pool_lock_data_region(pool->pmd, begin, end);
+	if (r) {
+		return r;
+	}
+
+	// wait for all in flight io to complete so we know the locked region has taken effect
+	// generate passdown io for free areas of the region
+
+	while (true) {
+		dm_block_t b = begin;
+		dm_block_t run_begin, run_end;
+		r = dm_pool_find_unused_data(pool->pmd, b, end, &run_begin,
+					     &run_end);
+		if (r) {
+			// FIXME: differentiate between no range found, and a real error
+			break;
+		}
+
+		// FIXME: issue passdown
+
+		b = run_end;
+	}
+
+	dm_pool_unlock_data_region(pool->pmd, begin, end);
+	return r;
+}
+
 /*
  * Messages supported:
  *   create_thin	<dev_id>
@@ -3840,6 +3889,7 @@ static int process_release_metadata_snap_mesg(unsigned int argc, char **argv, st
  *   set_transaction_id <current_trans_id> <new_trans_id>
  *   reserve_metadata_snap
  *   release_metadata_snap
+ *   trim <data block begin> <data block end>
  */
 static int pool_message(struct dm_target *ti, unsigned int argc, char **argv,
 			char *result, unsigned int maxlen)
@@ -3871,6 +3921,9 @@ static int pool_message(struct dm_target *ti, unsigned int argc, char **argv,
 
 	else if (!strcasecmp(argv[0], "release_metadata_snap"))
 		r = process_release_metadata_snap_mesg(argc, argv, pool);
+
+	else if (!strcasecmp(argv[0], "trim"))
+		r = process_trim(argc, argv, pool);
 
 	else
 		DMWARN("Unrecognised thin pool target message received: %s", argv[0]);
