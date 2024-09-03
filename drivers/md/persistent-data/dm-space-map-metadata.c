@@ -354,7 +354,6 @@ static int sm_metadata_count_is_more_than_one(struct dm_space_map *sm,
 	for (i = smm->uncommitted.begin;
 	     i != smm->uncommitted.end;
 	     i = brb_next(&smm->uncommitted, i)) {
-
 		struct block_op *op = smm->uncommitted.bops + i;
 
 		if (b < op->b || b >= op->e)
@@ -574,6 +573,7 @@ static const struct dm_space_map ops = {
 	.commit = sm_metadata_commit,
 	.root_size = sm_metadata_root_size,
 	.copy_root = sm_metadata_copy_root,
+	.next_free_run = NULL,
 	.register_threshold_callback = sm_metadata_register_threshold_callback
 };
 
@@ -711,6 +711,7 @@ static const struct dm_space_map bootstrap_ops = {
 	.commit = sm_bootstrap_commit,
 	.root_size = sm_bootstrap_root_size,
 	.copy_root = sm_bootstrap_copy_root,
+	.next_free_run = NULL,
 	.register_threshold_callback = NULL
 };
 
