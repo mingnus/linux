@@ -2992,11 +2992,33 @@ static int truncate_oblocks(struct cache *cache)
 	return 0;
 }
 
+static void reset_policy(struct cache* cache)
+{
+	dm_cblock_t cblock;
+	dm_cblock_t residency;
+	int r;
+
+	residency = policy_residency(cache->policy);
+	if (!residency)
+		return;
+
+	for (cblock = 0; cblock < cache->cache_size; cblock++) {
+		r = policy_invalidate_mapping(cache->policy, cblock);
+		BUG_ON(r && r != -ENODATA);
+	}
+}
+
 static int cache_preresume(struct dm_target *ti)
 {
 	int r = 0;
 	struct cache *cache = ti->private;
 	dm_cblock_t csize = get_cache_dev_size(cache);
+
+	if (!cache->loaded_mappings) {
+		reset_policy(cache);
+		clear_bitset(cache->dirty_bitset, from_cblock(cache->cache_size));
+		clear_bitset(cache->invalid_bitset, from_cblock(cache->cache_size));
+	}
 
 	/*
 	 * Check to see if the cache has resized.
