@@ -2992,6 +2992,22 @@ static int truncate_oblocks(struct cache *cache)
 	return 0;
 }
 
+static void reset_policy(struct cache* cache)
+{
+	dm_cblock_t cblock;
+	dm_cblock_t residency;
+	int r;
+
+	residency = policy_residency(cache->policy);
+	if (!residency)
+		return;
+
+	for (cblock = 0; cblock < cache->cache_size; cblock++) {
+		r = policy_invalidate_mapping(cache->policy, cblock);
+		BUG_ON(r && r != -ENODATA);
+	}
+}
+
 static int cache_preresume(struct dm_target *ti)
 {
 	int r = 0;
@@ -3013,6 +3029,10 @@ static int cache_preresume(struct dm_target *ti)
 	}
 
 	if (!cache->loaded_mappings) {
+		reset_policy(cache);
+		clear_bitset(cache->dirty_bitset, from_cblock(cache->cache_size));
+		clear_bitset(cache->invalid_bitset, from_cblock(cache->cache_size));
+
 		r = dm_cache_load_mappings(cache->cmd, cache->policy,
 					   load_filtered_mapping, cache);
 		if (r) {
