@@ -159,7 +159,7 @@ int dm_thin_find_mapped_range(struct dm_thin_device *td,
 /*
  * Obtain an unused block.
  */
-int dm_pool_alloc_data_block(struct dm_pool_metadata *pmd, dm_block_t *result);
+int dm_thin_alloc_data_block(struct dm_thin_device *td, dm_block_t *result);
 
 /*
  * Insert or remove block.
@@ -236,6 +236,26 @@ typedef int (*dm_pool_pre_commit_fn)(void *context);
 void dm_pool_register_pre_commit_callback(struct dm_pool_metadata *pmd,
 					  dm_pool_pre_commit_fn fn,
 					  void *context);
+
+int dm_pool_lock_data_region(struct dm_pool_metadata *pmd, dm_block_t begin,
+			     dm_block_t end);
+
+int dm_pool_unlock_data_region(struct dm_pool_metadata *pmd, dm_block_t begin,
+			       dm_block_t end);
+
+int dm_pool_find_unused_data(struct dm_pool_metadata *pmd, dm_block_t begin,
+			     dm_block_t end, dm_block_t *data_begin,
+			     dm_block_t *data_end);
+
+int dm_pool_lock_data_region(struct dm_pool_metadata *pmd, dm_block_t begin,
+			     dm_block_t end);
+
+int dm_pool_unlock_data_region(struct dm_pool_metadata *pmd, dm_block_t begin,
+			       dm_block_t end);
+
+int dm_pool_find_unused_data(struct dm_pool_metadata *pmd, dm_block_t begin,
+			     dm_block_t end, dm_block_t *data_begin,
+			     dm_block_t *data_end);
 
 /*----------------------------------------------------------------*/
 

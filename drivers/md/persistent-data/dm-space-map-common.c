@@ -138,6 +138,16 @@ static unsigned int dm_bitmap_word_used(void *addr, unsigned int b)
 	return !(~bits & mask);
 }
 
+static unsigned int dm_bitmap_word_unused(void *addr, unsigned int b)
+{
+	__le64 *words_le = addr;
+	__le64 *w_le = words_le + (b >> ENTRIES_SHIFT);
+
+	uint64_t bits = le64_to_cpu(*w_le);
+
+	return bits == 0;
+}
+
 static unsigned int sm_lookup_bitmap(void *addr, unsigned int b)
 {
 	__le64 *words_le = addr;
@@ -187,6 +197,61 @@ static int sm_find_free(void *addr, unsigned int begin, unsigned int end,
 	}
 
 	return -ENOSPC;
+}
+
+static int sm_find_free_run(void *addr, unsigned int begin, unsigned int end,
+			    unsigned int *run_begin, unsigned int *run_end)
+{
+	unsigned int c = begin;
+
+	/* find the start of a free run */
+	while (c < end) {
+		if (!(c & (ENTRIES_PER_WORD - 1))) {
+			if (dm_bitmap_word_unused(addr, c)) {
+				*run_begin = c;
+				break;
+			}
+			if (dm_bitmap_word_used(addr, c)) {
+				c += ENTRIES_PER_WORD;
+				continue;
+			}
+		}
+
+		if (!sm_lookup_bitmap(addr, c)) {
+			*run_begin = c;
+			break;
+		}
+
+		c++;
+	}
+
+	if (c >= end)
+		return -ENOSPC;
+
+	/* find the end of the free run */
+	*run_end = c + 1;
+	while (*run_end < end) {
+		if (!(*run_end & (ENTRIES_PER_WORD - 1))) {
+			if (dm_bitmap_word_used(addr, *run_end))
+				break;
+			if (dm_bitmap_word_unused(addr, *run_end)) {
+				*run_end += ENTRIES_PER_WORD;
+				continue;
+			}
+		}
+
+		if (sm_lookup_bitmap(addr, *run_end))
+			break;
+
+		(*run_end)++;
+	}
+
+	if (*run_end > end) {
+		/* we skipped over a zeroed word and overshot */
+		*run_end = end;
+	}
+
+	return 0;
 }
 
 /*----------------------------------------------------------------*/
@@ -397,7 +462,7 @@ int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
 	uint32_t count;
 
 	do {
-		r = sm_ll_find_free_block(new_ll, begin, new_ll->nr_blocks, b);
+		r = sm_ll_find_free_block(new_ll, begin, end, b);
 		if (r)
 			break;
 
@@ -415,6 +480,94 @@ int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
 	} while (count);
 
 	return r;
+}
+
+int sm_ll_find_free_run(struct ll_disk *ll, dm_block_t begin, dm_block_t end,
+			dm_block_t *result_b, dm_block_t *result_e)
+{
+	int r;
+	struct disk_index_entry ie_disk;
+	dm_block_t i, index_begin = begin;
+	dm_block_t index_end = dm_sector_div_up(end, ll->entries_per_block);
+
+	begin = do_div(index_begin, ll->entries_per_block);
+	end = do_div(end, ll->entries_per_block);
+	if (end == 0)
+		end = ll->entries_per_block;
+
+	for (i = index_begin; i < index_end; i++, begin = 0) {
+		struct dm_block *blk;
+		unsigned int position, run_end;
+		uint32_t bit_end;
+
+		r = ll->load_ie(ll, i, &ie_disk);
+		if (r < 0)
+			return r;
+
+		if (le32_to_cpu(ie_disk.nr_free) == 0)
+			continue;
+
+		r = dm_tm_read_lock(ll->tm, le64_to_cpu(ie_disk.blocknr),
+				    &dm_sm_bitmap_validator, &blk);
+		if (r < 0)
+			return r;
+
+		bit_end = (i == index_end - 1) ? end : ll->entries_per_block;
+
+		r = sm_find_free_run(
+			dm_bitmap_data(blk),
+			max_t(unsigned int, begin,
+			      le32_to_cpu(ie_disk.none_free_before)),
+			bit_end, &position, &run_end);
+
+		dm_tm_unlock(ll->tm, blk);
+
+		if (r == 0) {
+			*result_b = i * ll->entries_per_block +
+				    (dm_block_t)position;
+			*result_e =
+				i * ll->entries_per_block + (dm_block_t)run_end;
+			return 0;
+		}
+
+		if (r != -ENOSPC)
+			return r;
+
+		// If we didn't find a run in this bitmap, continue to the next one
+	}
+
+	return -ENOSPC;
+}
+
+int sm_ll_find_common_free_run(struct ll_disk *old_ll, struct ll_disk *new_ll,
+			       dm_block_t begin, dm_block_t end,
+			       dm_block_t *result_b, dm_block_t *result_e)
+{
+	int r;
+	dm_block_t old_b, old_e, new_b, new_e;
+
+	do {
+		r = sm_ll_find_free_run(new_ll, begin, end, &new_b, &new_e);
+		if (r)
+			return r;
+
+		r = sm_ll_find_free_run(old_ll, new_b, new_e, &old_b, &old_e);
+		if (r == -ENOSPC) {
+			/* No overlap, try again from the end of the new run */
+			begin = new_e;
+			continue;
+		}
+		if (r)
+			return r;
+
+		/* We found an overlapping free run */
+		*result_b = old_b;
+		*result_e = min(old_e, new_e);
+		return 0;
+
+	} while (begin < end);
+
+	return -ENOSPC;
 }
 
 /*----------------------------------------------------------------*/

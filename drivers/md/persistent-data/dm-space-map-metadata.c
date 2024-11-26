@@ -574,6 +574,7 @@ static const struct dm_space_map ops = {
 	.commit = sm_metadata_commit,
 	.root_size = sm_metadata_root_size,
 	.copy_root = sm_metadata_copy_root,
+	.next_free_run = NULL,
 	.register_threshold_callback = sm_metadata_register_threshold_callback
 };
 
@@ -653,6 +654,13 @@ static int sm_bootstrap_new_block(struct dm_space_map *sm, dm_block_t *b)
 	return 0;
 }
 
+static int sm_bootstrap_new_block_in_range(struct dm_space_map *sm,
+					   dm_block_t b, dm_block_t e,
+					   dm_block_t *result)
+{
+	BUG();
+}
+
 static int sm_bootstrap_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
 	int r;
@@ -708,9 +716,11 @@ static const struct dm_space_map bootstrap_ops = {
 	.inc_blocks = sm_bootstrap_inc_blocks,
 	.dec_blocks = sm_bootstrap_dec_blocks,
 	.new_block = sm_bootstrap_new_block,
+	.new_block_in_range = sm_bootstrap_new_block_in_range,
 	.commit = sm_bootstrap_commit,
 	.root_size = sm_bootstrap_root_size,
 	.copy_root = sm_bootstrap_copy_root,
+	.next_free_run = NULL,
 	.register_threshold_callback = NULL
 };
 
