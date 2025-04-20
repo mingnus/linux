@@ -1517,6 +1517,10 @@ static void invalidate_remove(struct work_struct *ws)
 	init_continuation(&mg->k, invalidate_completed);
 	continue_after_commit(&cache->committer, &mg->k);
 	remap_to_origin_clear_discard(cache, mg->overwrite_bio, mg->invalidate_oblock);
+
+	// FIXME: we should use dm_hook_bio() to capture the status code
+	dm_submit_bio_remap(mg->overwrite_bio, NULL);
+
 	mg->overwrite_bio = NULL;
 	schedule_commit(&cache->committer);
 }
@@ -1698,6 +1702,7 @@ static int map_bio(struct cache *cache, struct bio *bio, dm_oblock_t block,
 				bio_drop_shared_lock(cache, bio);
 				atomic_inc(&cache->stats.demotion);
 				invalidate_start(cache, cblock, block, bio);
+				return DM_MAPIO_SUBMITTED;
 			} else
 				remap_to_origin_clear_discard(cache, bio, block);
 		} else {
