@@ -1450,6 +1450,17 @@ static int mg_start(struct cache *cache, struct policy_work *op, struct bio *bio
  *--------------------------------------------------------------
  */
 
+static void invalidate_retry(struct dm_cache_migration *mg)
+{
+	struct cache *cache = mg->cache;
+
+	if (mg->overwrite_bio)
+		defer_bio(cache, mg->overwrite_bio);
+
+	free_migration(mg);
+	background_work_end(cache);
+}
+
 static void invalidate_complete(struct dm_cache_migration *mg, bool success)
 {
 	struct bio_list bios;
@@ -1517,6 +1528,10 @@ static void invalidate_remove(struct work_struct *ws)
 	init_continuation(&mg->k, invalidate_completed);
 	continue_after_commit(&cache->committer, &mg->k);
 	remap_to_origin_clear_discard(cache, mg->overwrite_bio, mg->invalidate_oblock);
+
+	// FIXME: we should use dm_hook_bio() to capture the status code
+	dm_submit_bio_remap(mg->overwrite_bio, NULL);
+
 	mg->overwrite_bio = NULL;
 	schedule_commit(&cache->committer);
 }
@@ -1535,7 +1550,7 @@ static int invalidate_lock(struct dm_cache_migration *mg)
 			    READ_WRITE_LOCK_LEVEL, prealloc, &mg->cell);
 	if (r < 0) {
 		free_prison_cell(cache, prealloc);
-		invalidate_complete(mg, false);
+		invalidate_retry(mg);
 		return r;
 	}
 
@@ -1697,6 +1712,7 @@ static int map_bio(struct cache *cache, struct bio *bio, dm_oblock_t block,
 				bio_drop_shared_lock(cache, bio);
 				atomic_inc(&cache->stats.demotion);
 				invalidate_start(cache, cblock, block, bio);
+				return DM_MAPIO_SUBMITTED;
 			} else
 				remap_to_origin_clear_discard(cache, bio, block);
 		} else {
