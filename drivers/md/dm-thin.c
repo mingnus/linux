@@ -742,7 +742,7 @@ static void inc_all_io_entry(struct pool *pool, struct bio *bio)
 {
 	struct dm_thin_endio_hook *h;
 
-	if (bio_op(bio) == REQ_OP_DISCARD)
+	if (bio_op(bio) == REQ_OP_DISCARD || bio_op(bio) == REQ_OP_WRITE_ZEROES)
 		return;
 
 	h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
@@ -909,7 +909,7 @@ static void __inc_remap_and_issue_cell(void *context,
 	struct bio *bio;
 
 	while ((bio = bio_list_pop(&cell->bios))) {
-		if (op_is_flush(bio->bi_opf) || bio_op(bio) == REQ_OP_DISCARD)
+		if (op_is_flush(bio->bi_opf) || bio_op(bio) == REQ_OP_DISCARD || bio_op(bio) == REQ_OP_WRITE_ZEROES)
 			bio_list_add(&info->defer_bios, bio);
 		else {
 			inc_all_io_entry(info->tc->pool, bio);
@@ -1834,7 +1834,8 @@ static void __remap_and_issue_shared_cell(void *context,
 
 	while ((bio = bio_list_pop(&cell->bios))) {
 		if (bio_data_dir(bio) == WRITE || op_is_flush(bio->bi_opf) ||
-		    bio_op(bio) == REQ_OP_DISCARD)
+		    bio_op(bio) == REQ_OP_DISCARD ||
+		    bio_op(bio) == REQ_OP_WRITE_ZEROES)
 			bio_list_add(&info->defer_bios, bio);
 		else {
 			struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
@@ -2223,7 +2224,7 @@ static void process_thin_deferred_bios(struct thin_c *tc)
 			break;
 		}
 
-		if (bio_op(bio) == REQ_OP_DISCARD)
+		if (bio_op(bio) == REQ_OP_DISCARD || bio_op(bio) == REQ_OP_WRITE_ZEROES)
 			pool->process_discard(tc, bio);
 		else
 			pool->process_bio(tc, bio);
@@ -2310,7 +2311,7 @@ static void process_thin_deferred_cells(struct thin_c *tc)
 				return;
 			}
 
-			if (bio_op(cell->holder) == REQ_OP_DISCARD)
+			if (bio_op(cell->holder) == REQ_OP_DISCARD || bio_op(cell->holder) == REQ_OP_WRITE_ZEROES)
 				pool->process_discard_cell(tc, cell);
 			else
 				pool->process_cell(tc, cell);
@@ -2741,7 +2742,9 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	if (op_is_flush(bio->bi_opf) || bio_op(bio) == REQ_OP_DISCARD) {
+	if (op_is_flush(bio->bi_opf) ||
+	    bio_op(bio) == REQ_OP_DISCARD ||
+	    bio_op(bio) == REQ_OP_WRITE_ZEROES) {
 		thin_defer_bio_with_throttle(tc, bio);
 		return DM_MAPIO_SUBMITTED;
 	}
@@ -3397,6 +3400,7 @@ static int pool_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 */
 	if (pf.discard_enabled && pf.discard_passdown) {
 		ti->num_discard_bios = 1;
+		ti->num_write_zeroes_bios = 1;
 		/*
 		 * Setting 'discards_supported' circumvents the normal
 		 * stacking of discard limits (this keeps the pool and
@@ -4277,6 +4281,7 @@ static int thin_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (tc->pool->pf.discard_enabled) {
 		ti->discards_supported = true;
 		ti->num_discard_bios = 1;
+		ti->num_write_zeroes_bios = 1;
 		ti->max_discard_granularity = true;
 	}
 
@@ -4492,6 +4497,7 @@ static void thin_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	if (pool->pf.discard_enabled) {
 		limits->discard_granularity = pool->sectors_per_block << SECTOR_SHIFT;
 		limits->max_hw_discard_sectors = pool->sectors_per_block * BIO_PRISON_MAX_RANGE;
+		limits->max_write_zeroes_sectors = pool->sectors_per_block * BIO_PRISON_MAX_RANGE;
 	}
 }
 

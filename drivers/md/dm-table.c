@@ -1734,8 +1734,16 @@ static bool dm_table_supports_write_zeroes(struct dm_table *t)
 		if (!ti->num_write_zeroes_bios)
 			return false;
 
-		if (!ti->type->iterate_devices ||
-		    ti->type->iterate_devices(ti, device_not_write_zeroes_capable, NULL))
+		/*
+		 * FIXME: there should be an extra write_zeroes_supported flag
+		 * indicating the target receives write zeroes regardless of the
+		 * underlying devices. Here we use the num_write_zeroes_bios as
+		 * a tempoarary workaround.
+		 * See also: commit 8a74d29d541cd
+		 */
+		if (!ti->num_write_zeroes_bios &&
+		    (!ti->type->iterate_devices ||
+		     ti->type->iterate_devices(ti, device_not_write_zeroes_capable, NULL)))
 			return false;
 	}
 
