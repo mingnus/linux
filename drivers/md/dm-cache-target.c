@@ -2668,7 +2668,7 @@ static int cache_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_REMAPPED;
 	}
 
-	if (discard_or_flush(bio)) {
+	if (discard_or_flush(bio) || passthrough_mode(cache)) {
 		defer_bio(cache, bio);
 		return DM_MAPIO_SUBMITTED;
 	}
