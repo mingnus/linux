@@ -2579,7 +2579,6 @@ static int cache_create(struct cache_args *ca, struct cache **result)
 	cache->loaded_mappings = false;
 	cache->loaded_discards = false;
 
-	load_stats(cache);
 
 	atomic_set(&cache->stats.demotion, 0);
 	atomic_set(&cache->stats.promotion, 0);
@@ -3124,6 +3123,8 @@ static int cache_preresume(struct dm_target *ti)
 
 		cache->loaded_discards = true;
 	}
+
+	load_stats(cache);
 
 	return r;
 }
