@@ -2499,12 +2499,6 @@ static int cache_create(struct cache_args *ca, struct cache **result)
 		goto bad;
 	}
 	cache->cmd = cmd;
-	set_cache_mode(cache, CM_WRITE);
-	if (get_cache_mode(cache) != CM_WRITE) {
-		*error = "Unable to get write access to metadata, please check/repair metadata.";
-		r = -EINVAL;
-		goto bad;
-	}
 
 	if (passthrough_mode(cache))
 		policy_allow_migrations(cache->policy, false);
@@ -3064,6 +3058,18 @@ static int cache_preresume(struct dm_target *ti)
 
 	if (!can_resume(cache))
 		return -EINVAL;
+
+	/*
+	 * Synchronize the cache mode with on-disk metadata if it's the first-time resume.
+	 */
+	if (!cache->sized) {
+		set_cache_mode(cache, CM_WRITE);
+		if (get_cache_mode(cache) != CM_WRITE) {
+			DMERR("%s: unable to get write access to metadata, "
+			"please check/repair metadata.", cache_device_name(cache));
+			return -EINVAL;
+		}
+	}
 
 	/*
 	 * Check to see if the cache has resized.
