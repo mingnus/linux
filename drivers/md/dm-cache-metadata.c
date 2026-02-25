@@ -1023,6 +1023,12 @@ static bool cmd_write_lock(struct dm_cache_metadata *cmd)
 			return;			\
 	} while (0)
 
+#define WRITE_LOCK_OR_GOTO(cmd, label)		\
+	do {					\
+		if (!cmd_write_lock((cmd)))	\
+			goto label;		\
+	} while (0)
+
 #define WRITE_UNLOCK(cmd) \
 	up_write(&(cmd)->root_lock)
 
@@ -1780,7 +1786,7 @@ int dm_cache_metadata_abort(struct dm_cache_metadata *cmd)
 	new_bm = dm_block_manager_create(cmd->bdev, DM_CACHE_METADATA_BLOCK_SIZE << SECTOR_SHIFT,
 					 CACHE_MAX_CONCURRENT_LOCKS);
 
-	WRITE_LOCK(cmd);
+	WRITE_LOCK_OR_GOTO(cmd, out);
 	if (cmd->fail_io) {
 		WRITE_UNLOCK(cmd);
 		goto out;
