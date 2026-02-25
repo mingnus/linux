@@ -2957,6 +2957,7 @@ static dm_cblock_t get_cache_dev_size(struct cache *cache)
 
 static bool can_resume(struct cache *cache)
 {
+	bool needs_check;
 	bool clean_when_opened;
 	int r;
 
@@ -2967,7 +2968,9 @@ static bool can_resume(struct cache *cache)
 	 * into the incomplete policy object.
 	 */
 	if (cache->sized && !cache->loaded_mappings) {
-		if (get_cache_mode(cache) != CM_WRITE)
+		r = dm_cache_metadata_needs_check(cache->cmd, &needs_check);
+
+		if (r || needs_check || get_cache_mode(cache) == CM_FAIL)
 			DMERR("%s: unable to resume a failed-loaded cache, please check metadata.",
 			      cache_device_name(cache));
 		else
