@@ -2243,7 +2243,7 @@ int __find_unused_data(struct dm_pool_metadata *pmd, dm_block_t begin,
 		       dm_block_t end, dm_block_t *data_begin,
 		       dm_block_t *data_end)
 {
-	return -EINVAL;
+	return dm_sm_next_free_run(pmd->data_sm, begin, end, data_begin, data_end);
 }
 
 int dm_pool_find_unused_data(struct dm_pool_metadata *pmd, dm_block_t begin,
