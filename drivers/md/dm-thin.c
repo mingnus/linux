@@ -3860,8 +3860,8 @@ static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 	// wait for all in flight io to complete so we know the locked region has taken effect
 	// generate passdown io for free areas of the region
 
+	dm_block_t b = begin;
 	while (true) {
-		dm_block_t b = begin;
 		dm_block_t run_begin, run_end;
 		r = dm_pool_find_unused_data(pool->pmd, b, end, &run_begin,
 					     &run_end);
