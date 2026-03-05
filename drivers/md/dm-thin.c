@@ -3846,8 +3846,8 @@ static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 		return -EINVAL;
 	}
 
-	if (kstrtoull(argv[1], 10, (unsigned long long *)&end)) {
-		DMWARN("trim message: bad begin '%s'", argv[1]);
+	if (kstrtoull(argv[2], 10, (unsigned long long *)&end)) {
+		DMWARN("trim message: bad end '%s'", argv[2]);
 		return -EINVAL;
 	}
 
