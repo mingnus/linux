@@ -3870,7 +3870,15 @@ static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 			break;
 		}
 
-		// FIXME: issue passdown
+		sector_t s = block_to_sectors(pool, run_begin);
+		sector_t len = block_to_sectors(pool, run_end - run_begin);
+		r = blkdev_issue_discard(pool->data_dev, s, len, GFP_NOIO);
+		if (r) {
+			DMWARN("trim: discard of blocks [%llu..%llu) failed: %d",
+				(unsigned long long)run_begin,
+				(unsigned long long)run_end, r);
+			break;
+		}
 
 		b = run_end;
 	}
