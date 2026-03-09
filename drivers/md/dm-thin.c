@@ -3867,6 +3867,8 @@ static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 					     &run_end);
 		if (r) {
 			// FIXME: differentiate between no range found, and a real error
+			if (r == -ENOSPC)
+				r = 0;
 			break;
 		}
 
