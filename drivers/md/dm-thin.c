@@ -3100,19 +3100,16 @@ static struct pool *__pool_find(struct mapped_device *pool_md,
 		}
 		__pool_inc(pool);
 
+	} else if (__pool_table_lookup(pool_md)) {
+		/*
+		 * pool_md was already registered with a md_dev differs to
+		 * metadata_dev.
+		 */
+		*error = "different pool cannot replace a pool";
+		return ERR_PTR(-EINVAL);
 	} else {
-		pool = __pool_table_lookup(pool_md);
-		if (pool) {
-			if (pool->md_dev != metadata_dev || pool->data_dev != data_dev) {
-				*error = "different pool cannot replace a pool";
-				return ERR_PTR(-EINVAL);
-			}
-			__pool_inc(pool);
-
-		} else {
-			pool = pool_create(pool_md, metadata_dev, data_dev, block_size, read_only, error);
-			*created = 1;
-		}
+		pool = pool_create(pool_md, metadata_dev, data_dev, block_size, read_only, error);
+		*created = 1;
 	}
 
 	return pool;
