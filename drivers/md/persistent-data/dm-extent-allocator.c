@@ -459,7 +459,7 @@ static struct node *__split_leaf(struct dm_extent_allocator *ea, struct node *n)
 
 	mid = n->begin + (n->end - n->begin) / 2;
 
-	new_parent->is_left_child = false;
+	right_child->is_left_child = false;
 	right_child->is_leaf = true;
 	right_child->nr_holders = 0;
 	right_child->begin = mid;
