@@ -207,6 +207,16 @@ struct dm_pool_metadata {
 	dm_block_t metadata_reserve;
 
 	/*
+	 * Data blocks within [trim_begin, trim_end) are fenced off from
+	 * allocation while a trim is discarding the free space among them.
+	 * Mirrors the exclusion window in data_sm so it can be re-applied
+	 * if the space maps are rebuilt (metadata abort).  trim_begin ==
+	 * trim_end means no trim is in progress.
+	 */
+	dm_block_t trim_begin;
+	dm_block_t trim_end;
+
+	/*
 	 * Set if a transaction has to be aborted but the attempt to roll back
 	 * to the previous (good) transaction failed.  The only pool metadata
 	 * operation possible in this state is the closing of the device.
@@ -972,6 +982,8 @@ struct dm_pool_metadata *dm_pool_metadata_open(struct block_device *bdev,
 	pmd->data_block_size = data_block_size;
 	pmd->pre_commit_fn = NULL;
 	pmd->pre_commit_context = NULL;
+	pmd->trim_begin = 0;
+	pmd->trim_end = 0;
 
 	r = __create_persistent_data_objects(pmd, format_device);
 	if (r) {
@@ -1919,6 +1931,16 @@ int dm_pool_abort_metadata(struct dm_pool_metadata *pmd)
 	r = __open_or_format_metadata(pmd, false);
 	if (r)
 		pmd->fail_io = true;
+	else if (pmd->trim_begin != pmd->trim_end)
+		/*
+		 * Re-fence the region an in-flight trim is discarding; the
+		 * rebuilt data_sm starts with no exclusion window.  Blocks
+		 * being discarded were free in the previous committed
+		 * transaction, so they are still free (and still safe to
+		 * discard) after rolling back to it.
+		 */
+		(void) dm_sm_disk_set_exclusion(pmd->data_sm, pmd->trim_begin,
+						pmd->trim_end);
 	pmd_write_unlock(pmd);
 	return r;
 }
@@ -2157,4 +2179,62 @@ void dm_pool_issue_prefetches(struct dm_pool_metadata *pmd)
 	if (!pmd->fail_io)
 		dm_tm_issue_prefetches(pmd->tm);
 	up_read(&pmd->root_lock);
+}
+
+int dm_pool_set_trim_fence(struct dm_pool_metadata *pmd,
+			   dm_block_t begin, dm_block_t end)
+{
+	int r = -EINVAL;
+
+	/*
+	 * pmd_write_lock_in_core is sufficient: fencing dirties no metadata,
+	 * it just has to be serialised against allocation.
+	 */
+	pmd_write_lock_in_core(pmd);
+	if (!pmd->fail_io) {
+		dm_block_t nr_blocks;
+
+		r = dm_sm_get_nr_blocks(pmd->data_sm, &nr_blocks);
+		if (!r) {
+			end = min(end, nr_blocks);
+			if (begin >= end)
+				r = -EINVAL;
+			else
+				r = dm_sm_disk_set_exclusion(pmd->data_sm,
+							     begin, end);
+		}
+
+		if (!r) {
+			pmd->trim_begin = begin;
+			pmd->trim_end = end;
+		}
+	}
+	pmd_write_unlock(pmd);
+
+	return r;
+}
+
+void dm_pool_clear_trim_fence(struct dm_pool_metadata *pmd)
+{
+	pmd_write_lock_in_core(pmd);
+	pmd->trim_begin = 0;
+	pmd->trim_end = 0;
+	if (!pmd->fail_io)
+		dm_sm_disk_clear_exclusion(pmd->data_sm);
+	pmd_write_unlock(pmd);
+}
+
+int dm_pool_next_free_data_run(struct dm_pool_metadata *pmd,
+			       dm_block_t begin, dm_block_t end,
+			       dm_block_t *result_begin, dm_block_t *result_end)
+{
+	int r = -EINVAL;
+
+	down_read(&pmd->root_lock);
+	if (!pmd->fail_io)
+		r = dm_sm_disk_next_free_run(pmd->data_sm, begin, end,
+					     result_begin, result_end);
+	up_read(&pmd->root_lock);
+
+	return r;
 }

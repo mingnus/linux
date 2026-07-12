@@ -237,6 +237,25 @@ void dm_pool_register_pre_commit_callback(struct dm_pool_metadata *pmd,
 					  dm_pool_pre_commit_fn fn,
 					  void *context);
 
+/*
+ * Support for discarding unused pool space (online trim).
+ *
+ * dm_pool_set_trim_fence stops data blocks within [begin, end) being
+ * allocated; the fence is in-core only.  Only one fence may be active at a
+ * time (-EBUSY otherwise).  end is clamped to the data device size.
+ *
+ * dm_pool_next_free_data_run finds the next run of blocks within
+ * [begin, end) that is free in both the current and the last committed
+ * transaction.  With the fence in place such a run cannot see any IO, so
+ * it may safely be discarded.  Returns -ENOSPC if there is no such run.
+ */
+int dm_pool_set_trim_fence(struct dm_pool_metadata *pmd,
+			   dm_block_t begin, dm_block_t end);
+void dm_pool_clear_trim_fence(struct dm_pool_metadata *pmd);
+int dm_pool_next_free_data_run(struct dm_pool_metadata *pmd,
+			       dm_block_t begin, dm_block_t end,
+			       dm_block_t *result_begin, dm_block_t *result_end);
+
 /*----------------------------------------------------------------*/
 
 #endif
