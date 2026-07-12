@@ -3883,10 +3883,12 @@ static int trim_fenced_chunk(struct pool *pool, dm_block_t begin, dm_block_t end
 	return r;
 }
 
-static int process_trim_mesg(unsigned int argc, char **argv, struct pool *pool)
+static int process_trim_mesg(unsigned int argc, char **argv, struct pool *pool,
+			     char *result, unsigned int maxlen)
 {
 	int r;
-	dm_block_t begin, end, size, chunk;
+	unsigned int sz = 0;
+	dm_block_t begin, end, size, chunk, chunk_end;
 
 	r = check_arg_count(argc, 3);
 	if (r)
@@ -3917,27 +3919,32 @@ static int process_trim_mesg(unsigned int argc, char **argv, struct pool *pool)
 		return -EINVAL;
 
 	/*
-	 * Fence and discard roughly 1GiB at a time so that only a small
-	 * part of the free space is unallocatable at any moment.
+	 * A message must be a bounded amount of work: it runs with the
+	 * pool's live table pinned (target_message holds an srcu read
+	 * lock across the whole call), so an unbounded trim would hold
+	 * up table reloads and suspends for its duration.  Process at
+	 * most ~1GiB of the data device, then report how far we got in
+	 * the message result; userspace repeats the message with the
+	 * returned cursor as the new <data_block_begin> until the cursor
+	 * reaches <data_block_end>.
 	 */
 	chunk = max_t(dm_block_t,
 		      (1 << (30 - SECTOR_SHIFT)) / pool->sectors_per_block, 1);
+	chunk_end = min(begin + chunk, end);
 
-	while (begin < end) {
-		dm_block_t chunk_end = min(begin + chunk, end);
+	r = trim_fenced_chunk(pool, begin, chunk_end);
+	if (r)
+		return r;
 
-		r = trim_fenced_chunk(pool, begin, chunk_end);
-		if (r)
-			return r;
+	/*
+	 * Blocks freed in the current transaction are not trimmable since
+	 * the committed metadata still references them.  Committing here
+	 * lets subsequent messages pick them up as the cursor advances.
+	 */
+	(void) commit(pool);
 
-		if (fatal_signal_pending(current))
-			return -EINTR;
-
-		cond_resched();
-		begin = chunk_end;
-	}
-
-	return 0;
+	DMEMIT("%llu", (unsigned long long) chunk_end);
+	return 1;
 }
 
 /*
@@ -3982,7 +3989,7 @@ static int pool_message(struct dm_target *ti, unsigned int argc, char **argv,
 		r = process_release_metadata_snap_mesg(argc, argv, pool);
 
 	else if (!strcasecmp(argv[0], "trim"))
-		r = process_trim_mesg(argc, argv, pool);
+		r = process_trim_mesg(argc, argv, pool, result, maxlen);
 
 	else
 		DMWARN("Unrecognised thin pool target message received: %s", argv[0]);

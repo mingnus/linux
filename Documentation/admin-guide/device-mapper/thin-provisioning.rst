@@ -395,11 +395,25 @@ iii) Messages
         data block size.  This is useful for reclaiming space on the
         device backing the data device when thin devices are used with
         discards that are not passed down (e.g. no_discard_passdown),
-        without the pool having to be taken offline.  The message
-        blocks until the range has been processed; free space is fenced
-        off from allocation in small chunks at a time, so concurrent IO
-        continues to be serviced.  Only one trim may be in progress at
-        a time.
+        without the pool having to be taken offline.
+
+        Each message processes a bounded amount of the range (roughly
+        1GiB of the data device, but at least one data block) and
+        returns the first unprocessed data block in the message result.
+        To trim a large range, repeat the message using the returned
+        value as the new <data block begin> until it reaches
+        <data block end>, e.g.::
+
+            begin=0
+            end=16384
+            while [ "$begin" -lt "$end" ]; do
+                begin=$(dmsetup message pool 0 trim $begin $end)
+            done
+
+        The free space being discarded is fenced off from allocation
+        for the duration of a message, so concurrent IO continues to
+        be serviced.  Only one trim message may be in flight at a time
+        (-EBUSY otherwise).
 
 'thin' target
 -------------
