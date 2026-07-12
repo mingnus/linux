@@ -124,6 +124,17 @@ int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
 				 dm_block_t begin, dm_block_t end, dm_block_t *result);
 
 /*
+ * Read-only lookups of runs of free blocks.  These do not guarantee to
+ * return the longest run possible; a run never spans an index entry
+ * boundary (ie. runs are at most entries_per_block long).
+ */
+int sm_ll_find_free_run(struct ll_disk *ll, dm_block_t begin, dm_block_t end,
+			dm_block_t *result_begin, dm_block_t *result_end);
+int sm_ll_find_common_free_run(struct ll_disk *old_ll, struct ll_disk *new_ll,
+			       dm_block_t begin, dm_block_t end,
+			       dm_block_t *result_begin, dm_block_t *result_end);
+
+/*
  * The next three functions return (via nr_allocations) the net number of
  * allocations that were made.  This number may be negative if there were
  * more frees than allocs.
