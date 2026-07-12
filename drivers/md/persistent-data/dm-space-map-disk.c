@@ -30,6 +30,18 @@ struct sm_disk {
 
 	dm_block_t begin;
 	dm_block_t nr_allocated_this_transaction;
+
+	/*
+	 * Blocks within [excl_begin, excl_end) will not be handed out by
+	 * new_block.  Used to fence a region while its free space is being
+	 * discarded (online trim).  excl_begin == excl_end means no window
+	 * is active.
+	 *
+	 * There is no internal locking; the caller must serialise these
+	 * against new_block (dm-thin does so with pmd->root_lock).
+	 */
+	dm_block_t excl_begin;
+	dm_block_t excl_end;
 };
 
 static void sm_disk_destroy(struct dm_space_map *sm)
@@ -127,22 +139,44 @@ static int sm_disk_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t 
 	return r;
 }
 
+/*
+ * Any block we allocate has to be free in both the old and current ll, and
+ * must not lie within the exclusion window.
+ */
+static int sm_disk_find_free(struct sm_disk *smd, dm_block_t begin,
+			     dm_block_t end, dm_block_t *b)
+{
+	int r;
+
+	do {
+		r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll,
+						 begin, end, b);
+		if (r)
+			return r;
+
+		if (*b < smd->excl_begin || *b >= smd->excl_end)
+			return 0;
+
+		/* the block is fenced off; skip over the window */
+		begin = smd->excl_end;
+	} while (begin < end);
+
+	return -ENOSPC;
+}
+
 static int sm_disk_new_block(struct dm_space_map *sm, dm_block_t *b)
 {
 	int r;
 	int32_t nr_allocations;
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 
-	/*
-	 * Any block we allocate has to be free in both the old and current ll.
-	 */
-	r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, smd->begin, smd->ll.nr_blocks, b);
+	r = sm_disk_find_free(smd, smd->begin, smd->ll.nr_blocks, b);
 	if (r == -ENOSPC)
 		/*
 		 * There's no free block between smd->begin and the end of the metadata device.
 		 * We search before smd->begin in case something has been freed.
 		 */
-		r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, 0, smd->begin, b);
+		r = sm_disk_find_free(smd, 0, smd->begin, b);
 
 	if (r)
 		return r;
@@ -197,6 +231,51 @@ static int sm_disk_copy_root(struct dm_space_map *sm, void *where_le, size_t max
 
 /*----------------------------------------------------------------*/
 
+int dm_sm_disk_set_exclusion(struct dm_space_map *sm, dm_block_t begin,
+			     dm_block_t end)
+{
+	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
+
+	if (begin >= end)
+		return -EINVAL;
+
+	if (smd->excl_begin != smd->excl_end)
+		return -EBUSY;
+
+	smd->excl_begin = begin;
+	smd->excl_end = end;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dm_sm_disk_set_exclusion);
+
+void dm_sm_disk_clear_exclusion(struct dm_space_map *sm)
+{
+	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
+
+	smd->excl_begin = 0;
+	smd->excl_end = 0;
+}
+EXPORT_SYMBOL_GPL(dm_sm_disk_clear_exclusion);
+
+int dm_sm_disk_next_free_run(struct dm_space_map *sm, dm_block_t begin,
+			     dm_block_t end, dm_block_t *result_begin,
+			     dm_block_t *result_end)
+{
+	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
+
+	/*
+	 * A run that's free in both the old and current transaction cannot
+	 * be referenced by committed metadata or have IO in flight, so it's
+	 * safe to discard provided new allocations are fenced off by the
+	 * exclusion window.
+	 */
+	return sm_ll_find_common_free_run(&smd->old_ll, &smd->ll, begin, end,
+					  result_begin, result_end);
+}
+EXPORT_SYMBOL_GPL(dm_sm_disk_next_free_run);
+
+/*----------------------------------------------------------------*/
+
 static struct dm_space_map ops = {
 	.destroy = sm_disk_destroy,
 	.extend = sm_disk_extend,
@@ -226,6 +305,8 @@ struct dm_space_map *dm_sm_disk_create(struct dm_transaction_manager *tm,
 
 	smd->begin = 0;
 	smd->nr_allocated_this_transaction = 0;
+	smd->excl_begin = 0;
+	smd->excl_end = 0;
 	memcpy(&smd->sm, &ops, sizeof(smd->sm));
 
 	r = sm_ll_new_disk(&smd->ll, tm);
@@ -260,6 +341,8 @@ struct dm_space_map *dm_sm_disk_open(struct dm_transaction_manager *tm,
 
 	smd->begin = 0;
 	smd->nr_allocated_this_transaction = 0;
+	smd->excl_begin = 0;
+	smd->excl_end = 0;
 	memcpy(&smd->sm, &ops, sizeof(smd->sm));
 
 	r = sm_ll_open_disk(&smd->ll, tm, root_le, len);
