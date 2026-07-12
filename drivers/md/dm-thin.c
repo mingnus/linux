@@ -3831,6 +3831,116 @@ static int process_release_metadata_snap_mesg(unsigned int argc, char **argv, st
 }
 
 /*
+ * Discard the free data blocks within [begin, end).  The region is fenced
+ * off from allocation for the duration, so it must be kept small; a large
+ * fence could pin enough free space to push a busy pool into out-of-data-
+ * space mode.
+ */
+static int trim_fenced_chunk(struct pool *pool, dm_block_t begin, dm_block_t end)
+{
+	int r;
+	struct bio *bio = NULL;
+	struct blk_plug plug;
+	dm_block_t b = begin;
+
+	r = dm_pool_set_trim_fence(pool->pmd, begin, end);
+	if (r)
+		return r;
+
+	blk_start_plug(&plug);
+	while (b < end) {
+		dm_block_t run_begin, run_end;
+
+		r = dm_pool_next_free_data_run(pool->pmd, b, end,
+					       &run_begin, &run_end);
+		if (r) {
+			if (r == -ENOSPC)
+				r = 0;	/* no free space left in this chunk */
+			break;
+		}
+
+		r = __blkdev_issue_discard(pool->data_dev,
+					   block_to_sectors(pool, run_begin),
+					   block_to_sectors(pool, run_end - run_begin),
+					   GFP_NOIO, &bio);
+		if (r)
+			break;
+
+		b = run_end;
+	}
+
+	if (bio) {
+		int r2 = submit_bio_wait(bio);
+
+		bio_put(bio);
+		if (!r)
+			r = r2;
+	}
+	blk_finish_plug(&plug);
+
+	dm_pool_clear_trim_fence(pool->pmd);
+
+	return r;
+}
+
+static int process_trim_mesg(unsigned int argc, char **argv, struct pool *pool)
+{
+	int r;
+	dm_block_t begin, end, size, chunk;
+
+	r = check_arg_count(argc, 3);
+	if (r)
+		return r;
+
+	if (kstrtoull(argv[1], 10, (unsigned long long *)&begin)) {
+		DMWARN("trim message: invalid data block '%s'", argv[1]);
+		return -EINVAL;
+	}
+
+	if (kstrtoull(argv[2], 10, (unsigned long long *)&end)) {
+		DMWARN("trim message: invalid data block '%s'", argv[2]);
+		return -EINVAL;
+	}
+
+	if (get_pool_mode(pool) != PM_WRITE) {
+		DMERR("%s: unable to service trim message in current mode",
+		      dm_device_name(pool->pool_md));
+		return -EINVAL;
+	}
+
+	r = dm_pool_get_data_dev_size(pool->pmd, &size);
+	if (r)
+		return r;
+
+	end = min(end, size);
+	if (begin >= end)
+		return -EINVAL;
+
+	/*
+	 * Fence and discard roughly 1GiB at a time so that only a small
+	 * part of the free space is unallocatable at any moment.
+	 */
+	chunk = max_t(dm_block_t,
+		      (1 << (30 - SECTOR_SHIFT)) / pool->sectors_per_block, 1);
+
+	while (begin < end) {
+		dm_block_t chunk_end = min(begin + chunk, end);
+
+		r = trim_fenced_chunk(pool, begin, chunk_end);
+		if (r)
+			return r;
+
+		if (fatal_signal_pending(current))
+			return -EINTR;
+
+		cond_resched();
+		begin = chunk_end;
+	}
+
+	return 0;
+}
+
+/*
  * Messages supported:
  *   create_thin	<dev_id>
  *   create_snap	<dev_id> <origin_id>
@@ -3838,6 +3948,7 @@ static int process_release_metadata_snap_mesg(unsigned int argc, char **argv, st
  *   set_transaction_id <current_trans_id> <new_trans_id>
  *   reserve_metadata_snap
  *   release_metadata_snap
+ *   trim		<data_block_begin> <data_block_end>
  */
 static int pool_message(struct dm_target *ti, unsigned int argc, char **argv,
 			char *result, unsigned int maxlen)
@@ -3869,6 +3980,9 @@ static int pool_message(struct dm_target *ti, unsigned int argc, char **argv,
 
 	else if (!strcasecmp(argv[0], "release_metadata_snap"))
 		r = process_release_metadata_snap_mesg(argc, argv, pool);
+
+	else if (!strcasecmp(argv[0], "trim"))
+		r = process_trim_mesg(argc, argv, pool);
 
 	else
 		DMWARN("Unrecognised thin pool target message received: %s", argv[0]);

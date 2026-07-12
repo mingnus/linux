@@ -389,6 +389,18 @@ iii) Messages
     release_metadata_snap
         Release a previously reserved copy of the data mapping btree.
 
+    trim <data block begin> <data block end>
+        Discard the unused data blocks within the given range of the
+        pool's data device.  Block numbers are in units of the pool's
+        data block size.  This is useful for reclaiming space on the
+        device backing the data device when thin devices are used with
+        discards that are not passed down (e.g. no_discard_passdown),
+        without the pool having to be taken offline.  The message
+        blocks until the range has been processed; free space is fenced
+        off from allocation in small chunks at a time, so concurrent IO
+        continues to be serviced.  Only one trim may be in progress at
+        a time.
+
 'thin' target
 -------------
 
