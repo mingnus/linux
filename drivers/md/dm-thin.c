@@ -3831,6 +3831,51 @@ static int process_release_metadata_snap_mesg(unsigned int argc, char **argv, st
 	return r;
 }
 
+static int trim_locked_region(struct pool *pool, dm_block_t begin, dm_block_t end)
+{
+	int r;
+	struct bio *bio = NULL;
+	struct blk_plug plug;
+
+	// lock region in allocators
+	r = dm_pool_lock_data_region(pool->pmd, begin, end);
+	if (r)
+		return r;
+
+	blk_start_plug(&plug);
+
+	dm_block_t b = begin;
+	while (b < end) {
+		dm_block_t run_begin, run_end;
+		r = dm_pool_find_unused_data(pool->pmd, b, end, &run_begin,
+					     &run_end);
+		if (r) {
+			if (r == -ENOSPC)
+				r = 0; // no free space left in the specified range
+			break;
+		}
+
+		sector_t s = block_to_sectors(pool, run_begin);
+		sector_t len = block_to_sectors(pool, run_end - run_begin);
+		__blkdev_issue_discard(pool->data_dev, s, len, GFP_NOIO, &bio);
+
+		b = run_end;
+	}
+
+	if (bio) {
+		int r2 = submit_bio_wait(bio);
+		bio_put(bio);
+		if (!r)
+			r = r2;
+	}
+
+	blk_finish_plug(&plug);
+
+	dm_pool_unlock_data_region(pool->pmd, begin, end);
+
+	return r;
+}
+
 static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 {
 	int r;
@@ -3851,41 +3896,28 @@ static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 		return -EINVAL;
 	}
 
-	// lock region in allocators
-	r = dm_pool_lock_data_region(pool->pmd, begin, end);
-	if (r) {
-		return r;
-	}
-
 	// wait for all in flight io to complete so we know the locked region has taken effect
 	// generate passdown io for free areas of the region
 
-	dm_block_t b = begin;
-	while (true) {
-		dm_block_t run_begin, run_end;
-		r = dm_pool_find_unused_data(pool->pmd, b, end, &run_begin,
-					     &run_end);
-		if (r) {
-			// FIXME: differentiate between no range found, and a real error
-			if (r == -ENOSPC)
-				r = 0;
-			break;
-		}
+	// set the discard batch size to the max data block size
+	dm_block_t batch_blocks = max_t(dm_block_t,
+					DATA_DEV_BLOCK_SIZE_MAX_SECTORS / pool->sectors_per_block, 1);
 
-		sector_t s = block_to_sectors(pool, run_begin);
-		sector_t len = block_to_sectors(pool, run_end - run_begin);
-		r = blkdev_issue_discard(pool->data_dev, s, len, GFP_NOIO);
+	dm_block_t b = begin;
+	while (b < end) {
+		dm_block_t e = min(b + batch_blocks, end);
+		r = trim_locked_region(pool, b, e);
+
 		if (r) {
 			DMWARN("trim: discard of blocks [%llu..%llu) failed: %d",
-				(unsigned long long)run_begin,
-				(unsigned long long)run_end, r);
+				(unsigned long long)b,
+				(unsigned long long)e, r);
 			break;
 		}
 
-		b = run_end;
+		b = e;
 	}
 
-	dm_pool_unlock_data_region(pool->pmd, begin, end);
 	return r;
 }
 
