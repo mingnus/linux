@@ -301,12 +301,12 @@ static int __split_and_remove_range(struct dm_extent_allocator *ea,
 	struct node *new_node, *new_parent;
 
 	if (begin > original->begin && end < original->end) {
-		/* lock range is in the middle, need to split */
-		new_node = __alloc_node(ea);
-		if (!new_node) {
-			// Handle allocation failure
+		if (ea->nr_free_nodes < 2) {
 			return -ENOMEM;
 		}
+
+		/* lock range is in the middle, need to split */
+		new_node = __alloc_node(ea);
 
 		/* initialize new_node */
 		new_node->is_leaf = true;
@@ -320,10 +320,6 @@ static int __split_and_remove_range(struct dm_extent_allocator *ea,
 
 		/* create new parent node */
 		new_parent = __alloc_node(ea);
-		if (!new_parent) {
-			__free_node(ea, new_node);
-			return -ENOMEM;
-		}
 
 		/* initialize new_parent */
 		new_parent->is_leaf = false;
