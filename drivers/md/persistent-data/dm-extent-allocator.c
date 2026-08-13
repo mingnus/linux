@@ -119,6 +119,8 @@ static inline struct node *__alloc_node(struct dm_extent_allocator *ea)
 {
 	struct list_head *l;
 
+	BUG_ON(!ea->nr_free_nodes);
+
 	l = ea->free_nodes.next;
 	list_del(l);
 	ea->nr_free_nodes--;
