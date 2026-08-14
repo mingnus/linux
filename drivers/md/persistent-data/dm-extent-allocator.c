@@ -655,7 +655,7 @@ void dm_alloc_context_get(struct dm_extent_allocator *ea,
 	 * We try and maintain a couple of nodes per alloc context to avoid sharing.
 	 * If allocation fails it's no big deal; we'll just get more fragmentation.
 	 */
-	if (ea->nr_preallocated_nodes < ea->nr_allocation_contexts * 2)
+	if (ea->nr_preallocated_nodes < ea->nr_allocation_contexts * 2 + 2)
 		__prealloc_nodes(ea, 2, GFP_NOIO);
 
 	list_add(&ac->list, &ea->allocation_contexts);
