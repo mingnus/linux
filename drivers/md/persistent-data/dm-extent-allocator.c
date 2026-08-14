@@ -235,8 +235,8 @@ static int alloc_node_list(unsigned nr, int flags, struct list_head *result)
  * @ea: Pointer to the extent allocator.
  * @nr: Number of nodes to preallocate.
  */
-static void __prealloc_nodes(struct dm_extent_allocator *ea, unsigned nr,
-			     int flags)
+static int __prealloc_nodes(struct dm_extent_allocator *ea, unsigned nr,
+			    int flags)
 {
 	int r;
 	struct list_head new_nodes;
@@ -250,6 +250,7 @@ static void __prealloc_nodes(struct dm_extent_allocator *ea, unsigned nr,
 		}
 		ea->nr_preallocated_nodes += nr;
 	}
+	return r;
 }
 
 struct dm_extent_allocator *dm_extent_allocator_create(uint64_t nr_blocks)
