@@ -267,7 +267,10 @@ struct dm_extent_allocator *dm_extent_allocator_create(uint64_t nr_blocks)
 	ea->nr_allocation_contexts = 0;
 
 	INIT_LIST_HEAD(&ea->free_nodes);
-	__prealloc_nodes(ea, INITIAL_NR_NODES, GFP_KERNEL);
+	if (__prealloc_nodes(ea, INITIAL_NR_NODES, GFP_KERNEL)) {
+		kfree(ea);
+		return NULL;
+	}
 	INIT_LIST_HEAD(&ea->allocation_contexts);
 	__setup_initial_root(ea);
 	INIT_LIST_HEAD(&ea->locked_regions);
