@@ -285,6 +285,19 @@ struct pool {
 	struct dm_bio_prison_cell **cell_sort_array;
 
 	mempool_t mapping_pool;
+
+	/*
+	 * Background trim of the free data blocks in [trim_cursor, trim_end),
+	 * started by the "trim" message.  The state is protected by 'lock'.
+	 * do_trim() stops when the pool is suspended, and pool_resume()
+	 * restarts it, so trim_active means "requested and not yet finished".
+	 */
+	struct work_struct trim_work;
+	bool trim_active;
+	unsigned int trim_gen;	/* bumped by each trim message */
+	dm_block_t trim_cursor;
+	dm_block_t trim_end;
+	int trim_err;
 };
 
 static void metadata_operation_failed(struct pool *pool, const char *op, int r);
@@ -2910,6 +2923,12 @@ static void __pool_destroy(struct pool *pool)
 {
 	__pool_table_remove(pool);
 
+	/*
+	 * The pool is suspended (or was never resumed), so do_trim()
+	 * can't be in the middle of a unit; at most it is queued.
+	 */
+	cancel_work_sync(&pool->trim_work);
+
 	vfree(pool->cell_sort_array);
 	if (dm_pool_metadata_close(pool->pmd) < 0)
 		DMWARN("%s: dm_pool_metadata_close() failed.", __func__);
@@ -2931,6 +2950,8 @@ static void __pool_destroy(struct pool *pool)
 }
 
 static struct kmem_cache *_new_mapping_cache;
+
+static void do_trim(struct work_struct *ws);
 
 static struct pool *pool_create(struct mapped_device *pool_md,
 				struct block_device *metadata_dev,
@@ -2995,6 +3016,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	INIT_WORK(&pool->worker, do_worker);
 	INIT_DELAYED_WORK(&pool->waker, do_waker);
 	INIT_DELAYED_WORK(&pool->no_space_timeout, do_no_space_timeout);
+	INIT_WORK(&pool->trim_work, do_trim);
 	spin_lock_init(&pool->lock);
 	bio_list_init(&pool->deferred_flush_bios);
 	bio_list_init(&pool->deferred_flush_completions);
@@ -3005,6 +3027,11 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	pool->low_water_triggered = false;
 	pool->suspended = true;
 	pool->out_of_data_space = false;
+	pool->trim_active = false;
+	pool->trim_gen = 0;
+	pool->trim_cursor = 0;
+	pool->trim_end = 0;
+	pool->trim_err = 0;
 
 	pool->shared_read_ds = dm_deferred_set_create();
 	if (!pool->shared_read_ds) {
@@ -3550,6 +3577,149 @@ static int maybe_resize_metadata_dev(struct dm_target *ti, bool *need_commit)
 	return 0;
 }
 
+/*----------------------------------------------------------------
+ * Background trim
+ *--------------------------------------------------------------*/
+
+/*
+ * Discard the free blocks in [begin, end).  The region is locked in the
+ * allocator so the blocks can't be provisioned while the discards are in
+ * flight.
+ *
+ * The discards go to the pool device rather than the data device, as
+ * passdown discards do, so they are accounted in the pool device's
+ * in-flight I/O and can't bypass a pool suspend.
+ */
+static int trim_locked_region(struct pool *pool, dm_block_t begin, dm_block_t end)
+{
+	int r;
+	struct bio *bio = NULL;
+	struct blk_plug plug;
+	struct block_device *bdev = dm_disk(pool->pool_md)->part0;
+
+	r = dm_pool_lock_data_region(pool->pmd, begin, end);
+	if (r)
+		return r;
+
+	blk_start_plug(&plug);
+
+	dm_block_t b = begin;
+	while (b < end) {
+		dm_block_t run_begin, run_end;
+		r = dm_pool_find_unused_data(pool->pmd, b, end, &run_begin,
+					     &run_end);
+		if (r) {
+			if (r == -ENOSPC)
+				r = 0; // no free space left in the specified range
+			break;
+		}
+
+		sector_t s = block_to_sectors(pool, run_begin);
+		sector_t len = block_to_sectors(pool, run_end - run_begin);
+		__blkdev_issue_discard(bdev, s, len, GFP_NOIO, &bio);
+
+		b = run_end;
+	}
+
+	if (bio) {
+		int r2 = submit_bio_wait(bio);
+		bio_put(bio);
+		if (!r)
+			r = r2;
+	}
+
+	blk_finish_plug(&plug);
+
+	dm_pool_unlock_data_region(pool->pmd, begin, end);
+
+	return r;
+}
+
+/*
+ * Trims the requested range one unit at a time, until it's done, cancelled,
+ * or the pool is suspended.  The suspend check and the start of a unit are
+ * serialised against pool_presuspend() by pool->lock, and presuspend then
+ * flushes this work, so no unit is in flight once presuspend returns.
+ *
+ * Runs on system_long_wq rather than pool->wq: pool->wq is ordered, and a
+ * unit sleeping in submit_bio_wait() there would stall do_worker().
+ */
+static void do_trim(struct work_struct *ws)
+{
+	struct pool *pool = container_of(ws, struct pool, trim_work);
+	dm_block_t batch_blocks, b, e;
+	unsigned int gen;
+	int r;
+
+	// set the discard batch size to the max data block size
+	batch_blocks = max_t(dm_block_t,
+			     DATA_DEV_BLOCK_SIZE_MAX_SECTORS / pool->sectors_per_block, 1);
+
+	for (;;) {
+		spin_lock_irq(&pool->lock);
+		if (!pool->trim_active || pool->suspended) {
+			spin_unlock_irq(&pool->lock);
+			return;
+		}
+
+		if (pool->trim_cursor >= pool->trim_end) {
+			pool->trim_active = false;
+			spin_unlock_irq(&pool->lock);
+			DMINFO("%s: trim completed",
+			       dm_device_name(pool->pool_md));
+			return;
+		}
+
+		if (get_pool_mode(pool) >= PM_OUT_OF_METADATA_SPACE) {
+			pool->trim_active = false;
+			pool->trim_err = -EOPNOTSUPP;
+			spin_unlock_irq(&pool->lock);
+			DMWARN("%s: trim stopped: pool is not writable",
+			       dm_device_name(pool->pool_md));
+			return;
+		}
+
+		gen = pool->trim_gen;
+		b = pool->trim_cursor;
+		e = min(b + batch_blocks, pool->trim_end);
+		spin_unlock_irq(&pool->lock);
+
+		r = trim_locked_region(pool, b, e);
+
+		/*
+		 * Don't touch the state if the trim was cancelled and
+		 * another one started while this unit was in flight.
+		 */
+		spin_lock_irq(&pool->lock);
+		if (gen == pool->trim_gen) {
+			if (r) {
+				pool->trim_active = false;
+				pool->trim_err = r;
+			} else
+				pool->trim_cursor = e;
+		}
+		spin_unlock_irq(&pool->lock);
+
+		if (r) {
+			DMWARN("%s: trim: discard of blocks [%llu..%llu) failed: %d",
+			       dm_device_name(pool->pool_md),
+			       (unsigned long long)b, (unsigned long long)e, r);
+			return;
+		}
+
+		cond_resched();
+	}
+}
+
+/*
+ * Called from resume and presuspend_undo, after 'suspended' is cleared.
+ * do_trim() returns at once if no trim is active.
+ */
+static void queue_trim(struct pool *pool)
+{
+	queue_work(system_long_wq, &pool->trim_work);
+}
+
 /*
  * Retrieves the number of blocks of the data device from
  * the superblock and compares it to the actual device size,
@@ -3639,6 +3809,7 @@ static void pool_resume(struct dm_target *ti)
 	spin_unlock_irq(&pool->lock);
 
 	do_waker(&pool->waker.work);
+	queue_trim(pool);
 }
 
 static void pool_presuspend(struct dm_target *ti)
@@ -3651,6 +3822,15 @@ static void pool_presuspend(struct dm_target *ti)
 	spin_unlock_irq(&pool->lock);
 
 	pool_suspend_active_thins(pool);
+
+	/*
+	 * Wait for the trim unit in flight, if any.  do_trim() won't start
+	 * another one now that 'suspended' is set.  This is called before
+	 * DMF_BLOCK_IO_FOR_SUSPEND is set on the pool device, so the unit's
+	 * discards are still mapped and completed rather than deferred, and
+	 * its region is unlocked before the pool is suspended.
+	 */
+	flush_work(&pool->trim_work);
 }
 
 static void pool_presuspend_undo(struct dm_target *ti)
@@ -3663,6 +3843,8 @@ static void pool_presuspend_undo(struct dm_target *ti)
 	spin_lock_irq(&pool->lock);
 	pool->suspended = false;
 	spin_unlock_irq(&pool->lock);
+
+	queue_trim(pool);
 }
 
 static void pool_postsuspend(struct dm_target *ti)
@@ -3831,55 +4013,10 @@ static int process_release_metadata_snap_mesg(unsigned int argc, char **argv, st
 	return r;
 }
 
-static int trim_locked_region(struct pool *pool, dm_block_t begin, dm_block_t end)
-{
-	int r;
-	struct bio *bio = NULL;
-	struct blk_plug plug;
-
-	// lock region in allocators
-	r = dm_pool_lock_data_region(pool->pmd, begin, end);
-	if (r)
-		return r;
-
-	blk_start_plug(&plug);
-
-	dm_block_t b = begin;
-	while (b < end) {
-		dm_block_t run_begin, run_end;
-		r = dm_pool_find_unused_data(pool->pmd, b, end, &run_begin,
-					     &run_end);
-		if (r) {
-			if (r == -ENOSPC)
-				r = 0; // no free space left in the specified range
-			break;
-		}
-
-		sector_t s = block_to_sectors(pool, run_begin);
-		sector_t len = block_to_sectors(pool, run_end - run_begin);
-		__blkdev_issue_discard(pool->data_dev, s, len, GFP_NOIO, &bio);
-
-		b = run_end;
-	}
-
-	if (bio) {
-		int r2 = submit_bio_wait(bio);
-		bio_put(bio);
-		if (!r)
-			r = r2;
-	}
-
-	blk_finish_plug(&plug);
-
-	dm_pool_unlock_data_region(pool->pmd, begin, end);
-
-	return r;
-}
-
 static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 {
 	int r;
-	dm_block_t begin, end;
+	dm_block_t begin, end, nr_blocks;
 
 	r = check_arg_count(argc, 3);
 	if (r)
@@ -3896,29 +4033,91 @@ static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 		return -EINVAL;
 	}
 
-	// wait for all in flight io to complete so we know the locked region has taken effect
-	// generate passdown io for free areas of the region
+	r = dm_pool_get_data_dev_size(pool->pmd, &nr_blocks);
+	if (r)
+		return r;
 
-	// set the discard batch size to the max data block size
-	dm_block_t batch_blocks = max_t(dm_block_t,
-					DATA_DEV_BLOCK_SIZE_MAX_SECTORS / pool->sectors_per_block, 1);
-
-	dm_block_t b = begin;
-	while (b < end) {
-		dm_block_t e = min(b + batch_blocks, end);
-		r = trim_locked_region(pool, b, e);
-
-		if (r) {
-			DMWARN("trim: discard of blocks [%llu..%llu) failed: %d",
-				(unsigned long long)b,
-				(unsigned long long)e, r);
-			break;
-		}
-
-		b = e;
+	if (begin >= end || end > nr_blocks) {
+		DMWARN("trim message: bad range [%llu..%llu), data blocks %llu",
+		       (unsigned long long)begin, (unsigned long long)end,
+		       (unsigned long long)nr_blocks);
+		return -EINVAL;
 	}
 
-	return r;
+	/* without passdown the pool device doesn't accept discards */
+	if (!pool->pf.discard_passdown) {
+		DMWARN("trim message: discard passdown is disabled");
+		return -EOPNOTSUPP;
+	}
+
+	spin_lock_irq(&pool->lock);
+	if (pool->trim_active) {
+		spin_unlock_irq(&pool->lock);
+		DMWARN("trim message: a trim is already in progress");
+		return -EBUSY;
+	}
+	pool->trim_active = true;
+	pool->trim_gen++;
+	pool->trim_cursor = begin;
+	pool->trim_end = end;
+	pool->trim_err = 0;
+	spin_unlock_irq(&pool->lock);
+
+	/*
+	 * Don't wait for the trim here: the message is serviced with the
+	 * pool device's io_barrier SRCU held, which would hold off any
+	 * suspend for the whole trim.  If the pool is suspended, do_trim()
+	 * returns and pool_resume() queues it again.
+	 */
+	queue_trim(pool);
+
+	return 0;
+}
+
+static int process_trim_cancel(unsigned int argc, char **argv, struct pool *pool)
+{
+	int r;
+
+	r = check_arg_count(argc, 1);
+	if (r)
+		return r;
+
+	/* the unit in flight, if any, still completes */
+	spin_lock_irq(&pool->lock);
+	pool->trim_active = false;
+	spin_unlock_irq(&pool->lock);
+
+	return 0;
+}
+
+/*
+ * Reports "<active|idle> <cursor> <end> <error>".  Returns 1 so that
+ * dm-ioctl passes the result back to userspace.
+ */
+static int process_trim_status(unsigned int argc, char **argv, struct pool *pool,
+			       char *result, unsigned int maxlen)
+{
+	int r;
+	unsigned int sz = 0;
+	bool active;
+	dm_block_t cursor, end;
+	int err;
+
+	r = check_arg_count(argc, 1);
+	if (r)
+		return r;
+
+	spin_lock_irq(&pool->lock);
+	active = pool->trim_active;
+	cursor = pool->trim_cursor;
+	end = pool->trim_end;
+	err = pool->trim_err;
+	spin_unlock_irq(&pool->lock);
+
+	DMEMIT("%s %llu %llu %d", active ? "active" : "idle",
+	       (unsigned long long)cursor, (unsigned long long)end, err);
+
+	return 1;
 }
 
 /*
@@ -3930,6 +4129,8 @@ static int process_trim(unsigned int argc, char **argv, struct pool *pool)
  *   reserve_metadata_snap
  *   release_metadata_snap
  *   trim <data block begin> <data block end>
+ *   trim_cancel
+ *   trim_status
  */
 static int pool_message(struct dm_target *ti, unsigned int argc, char **argv,
 			char *result, unsigned int maxlen)
@@ -3964,6 +4165,12 @@ static int pool_message(struct dm_target *ti, unsigned int argc, char **argv,
 
 	else if (!strcasecmp(argv[0], "trim"))
 		r = process_trim(argc, argv, pool);
+
+	else if (!strcasecmp(argv[0], "trim_cancel"))
+		r = process_trim_cancel(argc, argv, pool);
+
+	else if (!strcasecmp(argv[0], "trim_status"))
+		r = process_trim_status(argc, argv, pool, result, maxlen);
 
 	else
 		DMWARN("Unrecognised thin pool target message received: %s", argv[0]);
