@@ -2951,9 +2951,6 @@ static void pool_features_init(struct pool_features *pf)
  *--------------------------------------------------------------
  */
 
-/* Upper bound on empty units processed per do_trim() run */
-#define TRIM_MAX_INLINE_UNITS 16
-
 static dm_block_t trim_unit_blocks(struct pool *pool)
 {
 	return max_t(dm_block_t,
@@ -3113,7 +3110,6 @@ static bool trim_issue_unit(struct pool *pool, dm_block_t begin, dm_block_t end)
 static void do_trim(struct work_struct *ws)
 {
 	struct pool *pool = container_of(ws, struct pool, trim_worker);
-	unsigned int inline_units = 0;
 	dm_block_t begin, end;
 
 	for (;;) {
@@ -3138,13 +3134,6 @@ static void do_trim(struct work_struct *ws)
 			return;
 		}
 
-		if (inline_units >= TRIM_MAX_INLINE_UNITS) {
-			/* Let do_worker() run between empty units */
-			spin_unlock_irq(&pool->lock);
-			queue_work(pool->wq, &pool->trim_worker);
-			return;
-		}
-
 		/*
 		 * Set INFLIGHT under the same lock that pool_presuspend()
 		 * takes to set pool->suspended, so presuspend either sees
@@ -3159,12 +3148,15 @@ static void do_trim(struct work_struct *ws)
 		spin_unlock_irq(&pool->lock);
 
 		if (trim_issue_unit(pool, begin, end))
-			return;
+			return;	/* trim_endio() will requeue us */
 
-		/* Nothing submitted: finish the unit here */
+		/*
+		 * Nothing submitted: finish the unit here, then requeue
+		 * rather than loop, so do_worker() can run between units.
+		 */
 		trim_finish_unit(pool);
-		inline_units++;
-		cond_resched();
+		queue_work(pool->wq, &pool->trim_worker);
+		return;
 	}
 }
 
