@@ -235,6 +235,17 @@ enum trim_unit_state {
 	TRIM_UNIT_DONE,		/* discard completed; region still locked */
 };
 
+/*
+ * The unit do_trim() is working on.  Only do_trim() touches it, and it
+ * never runs concurrently with itself, so it needs no lock.
+ */
+struct trim_unit {
+	dm_block_t begin;
+	dm_block_t end;
+	bool locked;	/* region is locked in the extent allocator */
+	int err;	/* error from locking or walking the region */
+};
+
 struct pool {
 	struct list_head list;
 	struct dm_target *ti;	/* Only set if a pool target is bound */
@@ -293,22 +304,18 @@ struct pool {
 	mempool_t mapping_pool;
 
 	/*
-	 * Background trim.  All fields below are protected by pool->lock.
-	 * At most one unit is outstanding at a time; while trim_unit is
-	 * TRIM_UNIT_INFLIGHT or TRIM_UNIT_DONE the extent allocator region
-	 * [trim_unit_begin, trim_unit_end) may be locked.
+	 * Background trim.  At most one unit is outstanding at a time.
+	 * trim_state through trim_err are protected by pool->lock.
 	 */
 	struct work_struct trim_worker;
 	wait_queue_head_t trim_wait;
-	enum trim_unit_state trim_unit;
+	enum trim_unit_state trim_state;
+	int trim_bio_err;		/* set by trim_unit_done() */
 	bool trim_active;		/* a trim request is in progress */
-	bool trim_unit_locked;		/* the unit's region is locked */
 	dm_block_t trim_cursor;
 	dm_block_t trim_end;
-	dm_block_t trim_unit_begin;
-	dm_block_t trim_unit_end;
-	int trim_unit_err;
 	int trim_err;			/* error that stopped the last trim */
+	struct trim_unit trim_unit;	/* owned by do_trim() */
 };
 
 static void metadata_operation_failed(struct pool *pool, const char *op, int r);
@@ -2943,6 +2950,13 @@ static void pool_features_init(struct pool_features *pf)
  * pending I/O.  trim_endio() requeues do_trim(), which unlocks the
  * region and starts the next unit.
  *
+ * Unit state transitions, under pool->lock:
+ *
+ *   NONE     -> INFLIGHT  trim_start_unit()
+ *   INFLIGHT -> DONE      trim_unit_done(), from trim_endio(), or
+ *                         directly if the unit has nothing to discard
+ *   DONE     -> NONE      trim_complete_unit()
+ *
  * pool_presuspend() stops new units and waits for the outstanding
  * one.  It runs before DMF_BLOCK_IO_FOR_SUSPEND is set, so the
  * outstanding discard can't be deferred by the suspend, and no
@@ -2970,74 +2984,67 @@ static bool trim_unit_idle(struct pool *pool)
 	bool r;
 
 	spin_lock_irq(&pool->lock);
-	r = pool->trim_unit == TRIM_UNIT_NONE;
+	r = pool->trim_state == TRIM_UNIT_NONE;
 	spin_unlock_irq(&pool->lock);
 
 	return r;
+}
+
+/*
+ * INFLIGHT -> DONE.  The region unlock needs process context, so
+ * requeue do_trim() to complete the unit.
+ */
+static void trim_unit_done(struct pool *pool, int bio_err)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&pool->lock, flags);
+	pool->trim_bio_err = bio_err;
+	pool->trim_state = TRIM_UNIT_DONE;
+	/*
+	 * Queue under the lock: once do_trim() sees TRIM_UNIT_DONE, the
+	 * unit can complete and the pool can be suspended and destroyed,
+	 * so @pool must not be touched after the unlock.
+	 */
+	queue_work(pool->wq, &pool->trim_worker);
+	spin_unlock_irqrestore(&pool->lock, flags);
 }
 
 static void trim_endio(struct bio *bio)
 {
 	struct pool *pool = bio->bi_private;
 	int err = blk_status_to_errno(bio->bi_status);
-	unsigned long flags;
 
 	bio_put(bio);
-
-	spin_lock_irqsave(&pool->lock, flags);
-	if (err && !pool->trim_unit_err)
-		pool->trim_unit_err = err;
-	pool->trim_unit = TRIM_UNIT_DONE;
-	/*
-	 * The region unlock needs process context.  Queue under the lock:
-	 * once do_trim() sees TRIM_UNIT_DONE, the unit can finish, the pool
-	 * can be suspended and destroyed, and @pool must not be touched.
-	 */
-	queue_work(pool->wq, &pool->trim_worker);
-	spin_unlock_irqrestore(&pool->lock, flags);
+	trim_unit_done(pool, err);
 }
 
 /*
- * Unlocks the unit's region, advances the cursor and returns the unit to
- * TRIM_UNIT_NONE.  The unit must not have a discard in flight.
+ * DONE -> NONE: unlocks the unit's region and advances the cursor.
+ * An error stops the trim; the trim_status message reports it.
  */
-static void trim_finish_unit(struct pool *pool)
+static void trim_complete_unit(struct pool *pool, struct trim_unit *u)
 {
-	dm_block_t begin, end;
-	bool locked;
 	int err;
 
-	spin_lock_irq(&pool->lock);
-	begin = pool->trim_unit_begin;
-	end = pool->trim_unit_end;
-	locked = pool->trim_unit_locked;
-	err = pool->trim_unit_err;
-	spin_unlock_irq(&pool->lock);
-
-	if (locked) {
-		int r = dm_pool_unlock_data_region(pool->pmd, begin, end);
+	if (u->locked) {
+		int r = dm_pool_unlock_data_region(pool->pmd, u->begin, u->end);
 
 		/* Only fails if the region wasn't locked */
 		WARN_ON_ONCE(r);
 	}
 
-	if (err)
-		DMERR_LIMIT("%s: trim of data blocks [%llu, %llu) failed: %d",
-			    dm_device_name(pool->pool_md),
-			    (unsigned long long)begin,
-			    (unsigned long long)end, err);
-
 	spin_lock_irq(&pool->lock);
+	err = u->err ?: pool->trim_bio_err;
 	if (err) {
 		pool->trim_err = err;
 		pool->trim_active = false;
 	} else if (pool->trim_active) {
-		pool->trim_cursor = end;
+		pool->trim_cursor = u->end;
 		if (pool->trim_cursor >= pool->trim_end)
 			pool->trim_active = false;
 	}
-	pool->trim_unit_locked = false;
-	pool->trim_unit = TRIM_UNIT_NONE;
+	pool->trim_state = TRIM_UNIT_NONE;
 	spin_unlock_irq(&pool->lock);
 
 	wake_up(&pool->trim_wait);
@@ -3045,35 +3052,30 @@ static void trim_finish_unit(struct pool *pool)
 
 /*
  * Locks the unit's region and submits discards for its free runs.
- * Returns true if a discard was submitted, in which case trim_endio()
- * completes the unit.  Otherwise the caller must complete it.
+ * Records any error in u->err.  Returns true if a discard was
+ * submitted, in which case trim_endio() moves the unit to DONE.
  */
-static bool trim_issue_unit(struct pool *pool, dm_block_t begin, dm_block_t end)
+static bool trim_issue_unit(struct pool *pool, struct trim_unit *u)
 {
 	struct block_device *bdev = dm_disk(pool->pool_md)->part0;
 	struct bio *bio = NULL;
 	struct blk_plug plug;
-	dm_block_t b = begin;
+	dm_block_t b = u->begin;
 	bool submitted = false;
 	int r;
 
-	r = dm_pool_lock_data_region(pool->pmd, begin, end);
+	r = dm_pool_lock_data_region(pool->pmd, u->begin, u->end);
 	if (r) {
-		spin_lock_irq(&pool->lock);
-		pool->trim_unit_err = r;
-		spin_unlock_irq(&pool->lock);
+		u->err = r;
 		return false;
 	}
-
-	spin_lock_irq(&pool->lock);
-	pool->trim_unit_locked = true;
-	spin_unlock_irq(&pool->lock);
+	u->locked = true;
 
 	blk_start_plug(&plug);
-	while (b < end) {
+	while (b < u->end) {
 		dm_block_t run_begin, run_end;
 
-		r = dm_pool_find_unused_data(pool->pmd, b, end, &run_begin,
+		r = dm_pool_find_unused_data(pool->pmd, b, u->end, &run_begin,
 					     &run_end);
 		if (r) {
 			if (r == -ENOSPC)
@@ -3086,16 +3088,14 @@ static bool trim_issue_unit(struct pool *pool, dm_block_t begin, dm_block_t end)
 				       GFP_NOIO, &bio);
 		b = run_end;
 	}
-
-	spin_lock_irq(&pool->lock);
-	pool->trim_unit_err = r;
-	spin_unlock_irq(&pool->lock);
+	u->err = r;
 
 	if (bio) {
 		/*
 		 * Bios already chained to this one are in flight, so it must
-		 * be submitted even if the walk failed.  The unit may complete
-		 * before submit_bio() returns; don't touch it after this.
+		 * be submitted even if the walk failed.  trim_endio() doesn't
+		 * touch @u, and the next do_trim() run can't start before
+		 * this one returns, so @u stays ours.
 		 */
 		bio->bi_end_io = trim_endio;
 		bio->bi_private = pool;
@@ -3108,45 +3108,35 @@ static bool trim_issue_unit(struct pool *pool, dm_block_t begin, dm_block_t end)
 }
 
 /*
- * Starts the next unit, if the trim may run.  The unit must be in
- * TRIM_UNIT_NONE.
+ * NONE -> INFLIGHT: starts the next unit, if the trim may continue.
  */
-static void trim_start_unit(struct pool *pool)
+static void trim_start_unit(struct pool *pool, struct trim_unit *u)
 {
-	dm_block_t begin, end;
-
 	/*
-	 * Set INFLIGHT under the same lock that pool_presuspend() takes
-	 * to set pool->suspended, so presuspend either sees this unit and
-	 * waits for it, or we see the flag here.
+	 * Check pool->suspended and set INFLIGHT under the same lock that
+	 * pool_presuspend() takes to set pool->suspended.  So presuspend
+	 * either sees this unit and waits for it, or we see the flag here.
 	 */
 	spin_lock_irq(&pool->lock);
-	if (WARN_ON_ONCE(pool->trim_unit != TRIM_UNIT_NONE) ||
-	    !trim_can_start_unit(pool)) {
+	if (!trim_can_start_unit(pool)) {
 		spin_unlock_irq(&pool->lock);
 		return;
 	}
-
-	begin = pool->trim_cursor;
-	end = min(begin + trim_unit_blocks(pool), pool->trim_end);
-	pool->trim_unit_begin = begin;
-	pool->trim_unit_end = end;
-	pool->trim_unit_err = 0;
-	pool->trim_unit = TRIM_UNIT_INFLIGHT;
+	*u = (struct trim_unit) {
+		.begin = pool->trim_cursor,
+		.end = min(pool->trim_cursor + trim_unit_blocks(pool),
+			   pool->trim_end),
+	};
+	pool->trim_state = TRIM_UNIT_INFLIGHT;
 	spin_unlock_irq(&pool->lock);
 
-	if (!trim_issue_unit(pool, begin, end)) {
+	if (!trim_issue_unit(pool, u)) {
 		/*
-		 * Nothing submitted: finish the unit here, then requeue
-		 * rather than start the next one, so do_worker() can run
-		 * between units.
+		 * Nothing submitted: complete the unit on the next run
+		 * rather than here, so do_worker() can run between units.
 		 */
-		trim_finish_unit(pool);
-		queue_work(pool->wq, &pool->trim_worker);
-		return;
+		trim_unit_done(pool, 0);
 	}
-
-	/* trim_endio() will requeue us */
 }
 
 /*
@@ -3157,10 +3147,11 @@ static void trim_start_unit(struct pool *pool)
 static void do_trim(struct work_struct *ws)
 {
 	struct pool *pool = container_of(ws, struct pool, trim_worker);
+	struct trim_unit *u = &pool->trim_unit;
 	enum trim_unit_state state;
 
 	spin_lock_irq(&pool->lock);
-	state = pool->trim_unit;
+	state = pool->trim_state;
 	spin_unlock_irq(&pool->lock);
 
 	switch (state) {
@@ -3173,16 +3164,15 @@ static void do_trim(struct work_struct *ws)
 		return;
 
 	case TRIM_UNIT_DONE:
-		trim_finish_unit(pool);
-		break;
+		trim_complete_unit(pool, u);
+		fallthrough;
 
 	case TRIM_UNIT_NONE:
-		break;
+		trim_start_unit(pool, u);
 	}
-
-	trim_start_unit(pool);
 }
 
+// FIXME: inline it?
 static void trim_kick(struct pool *pool)
 {
 	queue_work(pool->wq, &pool->trim_worker);
@@ -3205,7 +3195,7 @@ static void __pool_destroy(struct pool *pool)
 		destroy_workqueue(pool->wq);
 
 	/* pool_presuspend() must have drained any outstanding trim unit */
-	WARN_ON_ONCE(pool->trim_unit != TRIM_UNIT_NONE);
+	WARN_ON_ONCE(pool->trim_state != TRIM_UNIT_NONE);
 
 	if (pool->next_mapping)
 		mempool_free(pool->next_mapping, &pool->mapping_pool);
@@ -3293,7 +3283,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 
 	INIT_WORK(&pool->trim_worker, do_trim);
 	init_waitqueue_head(&pool->trim_wait);
-	pool->trim_unit = TRIM_UNIT_NONE;
+	pool->trim_state = TRIM_UNIT_NONE;
 	pool->trim_active = false;
 
 	pool->shared_read_ds = dm_deferred_set_create();
@@ -4170,7 +4160,7 @@ static int process_trim(unsigned int argc, char **argv, struct pool *pool)
 
 	spin_lock_irq(&pool->lock);
 	/* A cancelled trim may still have a unit outstanding */
-	if (pool->trim_active || pool->trim_unit != TRIM_UNIT_NONE) {
+	if (pool->trim_active || pool->trim_state != TRIM_UNIT_NONE) {
 		spin_unlock_irq(&pool->lock);
 		DMWARN("trim message: a trim is already in progress");
 		return -EBUSY;
@@ -4222,7 +4212,7 @@ static int process_trim_status(unsigned int argc, char **argv, struct pool *pool
 	spin_lock_irq(&pool->lock);
 	if (!pool->trim_active)
 		state = "idle";
-	else if (trim_can_start_unit(pool) || pool->trim_unit != TRIM_UNIT_NONE)
+	else if (trim_can_start_unit(pool) || pool->trim_state != TRIM_UNIT_NONE)
 		state = "running";
 	else
 		state = "paused";
