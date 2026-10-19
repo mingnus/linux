@@ -3107,62 +3107,80 @@ static bool trim_issue_unit(struct pool *pool, dm_block_t begin, dm_block_t end)
 	return submitted;
 }
 
+/*
+ * Starts the next unit, if the trim may run.  The unit must be in
+ * TRIM_UNIT_NONE.
+ */
+static void trim_start_unit(struct pool *pool)
+{
+	dm_block_t begin, end;
+
+	/*
+	 * Set INFLIGHT under the same lock that pool_presuspend() takes
+	 * to set pool->suspended, so presuspend either sees this unit and
+	 * waits for it, or we see the flag here.
+	 */
+	spin_lock_irq(&pool->lock);
+	if (WARN_ON_ONCE(pool->trim_unit != TRIM_UNIT_NONE) ||
+	    !trim_can_start_unit(pool)) {
+		spin_unlock_irq(&pool->lock);
+		return;
+	}
+
+	begin = pool->trim_cursor;
+	end = min(begin + trim_unit_blocks(pool), pool->trim_end);
+	pool->trim_unit_begin = begin;
+	pool->trim_unit_end = end;
+	pool->trim_unit_err = 0;
+	pool->trim_unit = TRIM_UNIT_INFLIGHT;
+	spin_unlock_irq(&pool->lock);
+
+	if (!trim_issue_unit(pool, begin, end)) {
+		/*
+		 * Nothing submitted: finish the unit here, then requeue
+		 * rather than start the next one, so do_worker() can run
+		 * between units.
+		 */
+		trim_finish_unit(pool);
+		queue_work(pool->wq, &pool->trim_worker);
+		return;
+	}
+
+	/* trim_endio() will requeue us */
+}
+
+/*
+ * Only do_trim() moves a unit NONE -> INFLIGHT and DONE -> NONE, and it
+ * never runs concurrently with itself on the ordered pool->wq.  So the
+ * state read here can't change before we act on it.
+ */
 static void do_trim(struct work_struct *ws)
 {
 	struct pool *pool = container_of(ws, struct pool, trim_worker);
-	dm_block_t begin, end;
+	enum trim_unit_state state;
 
-	for (;;) {
-		spin_lock_irq(&pool->lock);
-		switch (pool->trim_unit) {
-		case TRIM_UNIT_INFLIGHT:
-			/*
-			 * Not reached by current callers: each one queues
-			 * us only in NONE or DONE.  Ignore a spurious kick;
-			 * trim_endio() requeues us when the unit completes.
-			 */
-			spin_unlock_irq(&pool->lock);
-			return;
+	spin_lock_irq(&pool->lock);
+	state = pool->trim_unit;
+	spin_unlock_irq(&pool->lock);
 
-		case TRIM_UNIT_DONE:
-			spin_unlock_irq(&pool->lock);
-			trim_finish_unit(pool);
-			continue;
-
-		case TRIM_UNIT_NONE:
-			break;
-		}
-
-		if (!trim_can_start_unit(pool)) {
-			spin_unlock_irq(&pool->lock);
-			return;
-		}
-
+	switch (state) {
+	case TRIM_UNIT_INFLIGHT:
 		/*
-		 * Set INFLIGHT under the same lock that pool_presuspend()
-		 * takes to set pool->suspended, so presuspend either sees
-		 * this unit and waits for it, or we see the flag above.
+		 * Not reached by current callers: each one queues us only
+		 * in NONE or DONE.  Ignore a spurious kick; trim_endio()
+		 * requeues us when the unit completes.
 		 */
-		begin = pool->trim_cursor;
-		end = min(begin + trim_unit_blocks(pool), pool->trim_end);
-		pool->trim_unit_begin = begin;
-		pool->trim_unit_end = end;
-		pool->trim_unit_err = 0;
-		pool->trim_unit = TRIM_UNIT_INFLIGHT;
-		spin_unlock_irq(&pool->lock);
+		return;
 
-		if (!trim_issue_unit(pool, begin, end)) {
-			/*
-			 * Nothing submitted: finish the unit here, then requeue
-			 * rather than loop, so do_worker() can run between units.
-			 */
-			trim_finish_unit(pool);
-			queue_work(pool->wq, &pool->trim_worker);
-			return;
-		}
+	case TRIM_UNIT_DONE:
+		trim_finish_unit(pool);
+		break;
 
-		return; /* trim_endio() will requeue us */
+	case TRIM_UNIT_NONE:
+		break;
 	}
+
+	trim_start_unit(pool);
 }
 
 static void trim_kick(struct pool *pool)
