@@ -3151,16 +3151,17 @@ static void do_trim(struct work_struct *ws)
 		pool->trim_unit = TRIM_UNIT_INFLIGHT;
 		spin_unlock_irq(&pool->lock);
 
-		if (trim_issue_unit(pool, begin, end))
-			return;	/* trim_endio() will requeue us */
+		if (!trim_issue_unit(pool, begin, end)) {
+			/*
+			 * Nothing submitted: finish the unit here, then requeue
+			 * rather than loop, so do_worker() can run between units.
+			 */
+			trim_finish_unit(pool);
+			queue_work(pool->wq, &pool->trim_worker);
+			return;
+		}
 
-		/*
-		 * Nothing submitted: finish the unit here, then requeue
-		 * rather than loop, so do_worker() can run between units.
-		 */
-		trim_finish_unit(pool);
-		queue_work(pool->wq, &pool->trim_worker);
-		return;
+		return; /* trim_endio() will requeue us */
 	}
 }
 
