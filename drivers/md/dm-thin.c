@@ -3116,7 +3116,11 @@ static void do_trim(struct work_struct *ws)
 		spin_lock_irq(&pool->lock);
 		switch (pool->trim_unit) {
 		case TRIM_UNIT_INFLIGHT:
-			/* trim_endio() will requeue us */
+			/*
+			 * Not reached by current callers: each one queues
+			 * us only in NONE or DONE.  Ignore a spurious kick;
+			 * trim_endio() requeues us when the unit completes.
+			 */
 			spin_unlock_irq(&pool->lock);
 			return;
 
