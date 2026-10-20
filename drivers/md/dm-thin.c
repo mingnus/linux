@@ -4225,7 +4225,7 @@ static int process_trim_status(unsigned int argc, char **argv, struct pool *pool
  *   set_transaction_id <current_trans_id> <new_trans_id>
  *   reserve_metadata_snap
  *   release_metadata_snap
- *   trim <data block begin> <data block end>
+ *   trim		<data block begin> <data block end>
  *   trim_cancel
  *   trim_status
  */
