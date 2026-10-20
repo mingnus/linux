@@ -2979,17 +2979,6 @@ static bool trim_can_start_unit(struct pool *pool)
 	       pool->pf.discard_enabled && pool->pf.discard_passdown;
 }
 
-static bool trim_unit_idle(struct pool *pool)
-{
-	bool r;
-
-	spin_lock_irq(&pool->lock);
-	r = pool->trim_state == TRIM_UNIT_NONE;
-	spin_unlock_irq(&pool->lock);
-
-	return r;
-}
-
 /*
  * INFLIGHT -> DONE.  The region unlock needs process context, so
  * requeue do_trim() to complete the unit.
@@ -3929,16 +3918,17 @@ static void pool_presuspend(struct dm_target *ti)
 
 	spin_lock_irq(&pool->lock);
 	pool->suspended = true;
-	spin_unlock_irq(&pool->lock);
-
 	/*
 	 * Wait for the outstanding trim unit before DM core sets
 	 * DMF_BLOCK_IO_FOR_SUSPEND, so its discard isn't deferred and its
-	 * region isn't held across the suspend.  The trim discards don't
-	 * depend on the thins, so drain them first to keep thin I/O
+	 * region isn't held across the suspend.  pool->suspended stops new
+	 * units, so the state stays NONE after the wait.  The trim discards
+	 * don't depend on the thins, so drain them first to keep thin I/O
 	 * flowing meanwhile.
 	 */
-	wait_event(pool->trim_wait, trim_unit_idle(pool));
+	wait_event_lock_irq(pool->trim_wait,
+			    pool->trim_state == TRIM_UNIT_NONE, pool->lock);
+	spin_unlock_irq(&pool->lock);
 
 	pool_suspend_active_thins(pool);
 }
